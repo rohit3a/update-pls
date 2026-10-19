@@ -64,7 +64,7 @@ struct MenuView: View {
             }
             Text("v\(SelfUpdate.current)").font(.caption).foregroundStyle(.tertiary)
             Spacer()
-            SettingsLink { Text("Settings…") }.buttonStyle(.borderless)
+            Button("Settings…") { SettingsWindow.show(model) }.buttonStyle(.borderless)
             Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.borderless)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)

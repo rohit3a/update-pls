@@ -20,15 +20,16 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(intervalHours, forKey: "intervalHours"); scheduleChecks() }
     }
 
-    private var timer: Task<Void, Never>?
+    private var scheduler: NSBackgroundActivityScheduler?
     private var notified: Set<String> = []
 
     init() {
         disabledHosts = Set(UserDefaults.standard.stringArray(forKey: "disabledHosts") ?? [])
         let h = UserDefaults.standard.double(forKey: "intervalHours")
-        intervalHours = h > 0 ? h : 6
+        intervalHours = h > 0 ? h : 3
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge]) { _, _ in }
         scheduleChecks()
+        Task { await checkAll() }
     }
 
     var machines: [Machine] {
@@ -53,15 +54,22 @@ final class AppModel: ObservableObject {
         items.filter { $0.machine == m }.sorted { ($0.state.sortKey, $0.name) < ($1.state.sortKey, $1.name) }
     }
 
+    /// Background checks through macOS's activity scheduler, which picks an energy-friendly moment
+    /// within the tolerance (and catches up after sleep) instead of keeping a timer awake.
     func scheduleChecks() {
-        timer?.cancel()
-        let seconds = intervalHours * 3600
-        timer = Task { [weak self] in
-            while !Task.isCancelled {
+        scheduler?.invalidate()
+        let s = NSBackgroundActivityScheduler(identifier: "com.rohit3a.updatepls.check")
+        s.repeats = true
+        s.interval = intervalHours * 3600
+        s.tolerance = s.interval / 10
+        s.qualityOfService = .utility
+        s.schedule { [weak self] done in
+            Task { @MainActor in
                 await self?.checkAll()
-                try? await Task.sleep(for: .seconds(seconds))
+                done(.finished)
             }
         }
+        scheduler = s
     }
 
     func checkAll() async {

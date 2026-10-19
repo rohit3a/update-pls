@@ -18,15 +18,61 @@ struct UpdatePlsApp: App {
         MenuBarExtra {
             MenuView().environmentObject(model)
         } label: {
-            let n = model.updateCount
-            Image(systemName: n > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
-            if n > 0 { Text("\(n)") }
+            Image(nsImage: MenuIcon.image(count: model.updateCount))
         }
         .menuBarExtraStyle(.window)
+    }
+}
 
-        Settings {
-            SettingsView().environmentObject(model)
+/// The settings window. SwiftUI's Settings scene doesn't open reliably from a menu bar app, so it is managed here.
+@MainActor
+enum SettingsWindow {
+    private static var window: NSWindow?
+
+    static func show(_ model: AppModel) {
+        if window == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView().environmentObject(model)))
+            w.title = "Update pls Settings"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.center()
+            window = w
         }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+/// Menu bar icon: the down-arrow circle, with the update count punched into a badge when there are updates.
+/// A template image, so it follows the menu bar's light or dark look.
+enum MenuIcon {
+    static func image(count: Int) -> NSImage {
+        let symbol = NSImage(systemSymbolName: count > 0 ? "arrow.down.circle.fill" : "arrow.down.circle", accessibilityDescription: "Update pls")!
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))!
+        guard count > 0 else { symbol.isTemplate = true; return symbol }
+        let label = count > 99 ? "99+" : "\(count)"
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .bold)
+        let text = NSAttributedString(string: label, attributes: [.font: font, .foregroundColor: NSColor.black])
+        let badgeW = max(12, text.size().width + 6), badgeH: CGFloat = 12
+        let size = NSSize(width: symbol.size.width + badgeW - 4, height: 18)
+        let img = NSImage(size: size, flipped: false) { _ in
+            symbol.draw(in: NSRect(x: 0, y: (18 - symbol.size.height) / 2, width: symbol.size.width, height: symbol.size.height))
+            let badge = NSRect(x: size.width - badgeW, y: 18 - badgeH, width: badgeW, height: badgeH)
+            let ctx = NSGraphicsContext.current!
+            // Clear a ring around the badge, fill it, then cut the number out of it.
+            ctx.compositingOperation = .destinationOut
+            NSBezierPath(roundedRect: badge.insetBy(dx: -1.5, dy: -1.5), xRadius: 7.5, yRadius: 7.5).fill()
+            ctx.compositingOperation = .sourceOver
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 6, yRadius: 6).fill()
+            ctx.compositingOperation = .destinationOut
+            let t = text.size()
+            text.draw(at: NSPoint(x: badge.midX - t.width / 2, y: badge.midY - t.height / 2))
+            return true
+        }
+        img.isTemplate = true
+        img.accessibilityDescription = "Update pls, \(count) updates"
+        return img
     }
 }
 

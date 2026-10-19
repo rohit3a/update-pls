@@ -12,6 +12,8 @@ Claude Desktop and the Codex app don't have an update button. Update pls gives y
 
 The menu lists everything installed on each machine with its version and the latest one, grouped by brand (Claude Code and Claude Desktop under **Claude**, and so on).
 
+It checks again every 3 hours (change it in Settings), through macOS's background activity scheduler, which picks an energy-friendly moment. The menu bar icon shows how many updates are waiting.
+
 It finds them by itself: the CLIs on your `PATH` (including nvm, bun, brew, pipx and uv installs) and the apps in `/Applications`. On Windows hosts it uses `winget`, and on Linux it reads `dpkg`.
 
 ## How it updates
