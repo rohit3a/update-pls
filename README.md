@@ -62,6 +62,16 @@ The app binary doubles as a CLI:
 "/Applications/Update pls.app/Contents/MacOS/UpdatePls" update local/cursor
 ```
 
+## Skip and roll back
+
+Hover a tool and click **⋯** (or right-click it):
+
+- **Skip in Update all** leaves that tool alone when you press Update all, and leaves it out of the count on the icon. You can still update it on its own. A ⏸ marks skipped tools; click it to include the tool again.
+- **Roll back to …** puts back the version Update pls replaced:
+  - Mac apps come back from the copy kept when they were updated (one per app, in `~/Library/Application Support/Update pls/Backups`). The copy is checked first: same bundle ID and a valid signature. If the swap fails, the current version stays.
+  - npm, bun, pipx and uv tools, and Claude Code, reinstall that exact version.
+  - Once rolled back, the version is read again, and the tool is skipped in Update all so it stays put.
+
 ## Updating Update pls
 
 The app checks GitHub for a newer version of itself. If it was built from a git clone, **Update** pulls the clone, rebuilds it and reopens the new version.

@@ -16,6 +16,14 @@ final class AppModel: ObservableObject {
     @Published var disabledHosts: Set<String> {
         didSet { UserDefaults.standard.set(Array(disabledHosts), forKey: "disabledHosts") }
     }
+    /// Tools (`machine/tool`) that Update all leaves alone.
+    @Published var excluded: Set<String> {
+        didSet { UserDefaults.standard.set(Array(excluded), forKey: "excludedFromUpdateAll") }
+    }
+    /// The version each tool (`machine/tool`) was on before Update pls last updated it, for rollback.
+    @Published var previous: [String: String] {
+        didSet { UserDefaults.standard.set(previous, forKey: "previousVersions") }
+    }
     @Published var intervalHours: Double {
         didSet { UserDefaults.standard.set(intervalHours, forKey: "intervalHours"); scheduleChecks() }
     }
@@ -25,6 +33,8 @@ final class AppModel: ObservableObject {
 
     init() {
         disabledHosts = Set(UserDefaults.standard.stringArray(forKey: "disabledHosts") ?? [])
+        excluded = Set(UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
+        previous = UserDefaults.standard.dictionary(forKey: "previousVersions") as? [String: String] ?? [:]
         let h = UserDefaults.standard.double(forKey: "intervalHours")
         intervalHours = h > 0 ? h : 3
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge]) { _, _ in }
@@ -36,7 +46,36 @@ final class AppModel: ObservableObject {
         [Machine.local] + hosts.filter { !disabledHosts.contains($0) }.map { Machine(id: $0, name: $0) }
     }
 
-    var available: [Item] { items.filter { $0.state == .available && $0.canUpdate } }
+    var available: [Item] { items.filter { $0.state == .available && $0.canUpdate && !excluded.contains($0.key) } }
+
+    func toggleExcluded(_ item: Item) {
+        if excluded.contains(item.key) { excluded.remove(item.key) } else { excluded.insert(item.key) }
+    }
+
+    /// The version a rollback would go back to, if Update pls replaced one and can put it back.
+    func rollbackVersion(_ item: Item) -> String? {
+        guard item.supportsRollback, let v = previous[item.key], v != item.installed else { return nil }
+        return v
+    }
+
+    func rollback(_ item: Item) async {
+        guard let v = rollbackVersion(item), confirmRollback(item, to: v) else { return }
+        set(item.id) { $0.state = .updating; $0.log = "" }
+        let result = await Engine.rollback(item, to: v, relaunch: true)
+        let log = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.ok else {
+            let last = log.split(separator: "\n").last.map(String.init) ?? "Rollback failed"
+            set(item.id) { $0.state = .failed(result.timedOut ? "Timed out" : last); $0.log = log }
+            return
+        }
+        // Keep it on this version: Update all would otherwise take it straight back to the new one.
+        excluded.insert(item.key)
+        previous[item.key] = nil
+        await check(item.machine)
+        if let fresh = items.first(where: { $0.key == item.key }), fresh.installed != v {
+            set(fresh.id) { $0.state = .failed("Still on \(fresh.installed ?? "?") after rolling back"); $0.log = log }
+        }
+    }
 
     var selfUpdateAvailable: Bool { selfLatest.map { Version.isNewer($0, than: SelfUpdate.current) } ?? false }
 
@@ -136,6 +175,7 @@ final class AppModel: ObservableObject {
         let result = await Engine.update(item, relaunch: true)
         let log = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
         if result.ok {
+            if item.supportsRollback, let v = item.installed { previous[item.key] = v }
             // Confirm by reading the version again.
             await check(item.machine)
             if let fresh = items.first(where: { $0.id == item.id }) {
@@ -149,6 +189,17 @@ final class AppModel: ObservableObject {
 
     private func set(_ id: String, _ change: (inout Item) -> Void) {
         if let i = items.firstIndex(where: { $0.id == id }) { change(&items[i]) }
+    }
+
+    private func confirmRollback(_ item: Item, to v: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Roll back \(item.name) to \(v)?"
+        alert.informativeText = (item.running ? "\(item.name) will quit and reopen. " : "")
+            + "It will be skipped in Update all until you include it again."
+        alert.addButton(withTitle: "Roll Back")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func confirmRelaunch(_ items: [Item]) -> Bool {

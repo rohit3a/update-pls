@@ -49,8 +49,35 @@ struct Item: Identifiable, Hashable {
     var running = false
     var state: ItemState = .unknown
     var log = ""
+    /// From the catalog: how to install one exact version through the tool's own installer.
+    var installVersion: String?
 
     var id: String { "\(machine.id)/\(defID)/\(path)" }
+    /// Stable per machine and tool; used for the Update all skip list and rollback records.
+    var key: String { "\(machine.id)/\(defID)" }
+
+    /// The command that puts back version `v`, or nil when this install can't be rolled back that way.
+    /// Mac apps downloaded directly roll back from the copy kept at update time instead (see `Engine.rollback`).
+    func rollbackCommand(to v: String) -> String? {
+        guard os != .windows else { return nil }
+        switch method {
+        case let .npm(bin, prefix, pkg, _, w):
+            var pinned = self
+            pinned.method = .npm(bin: bin, prefix: prefix, package: pkg, tag: v, writable: w)
+            return pinned.command
+        case let .bun(pkg): return "bun add -g \(Shell.q("\(pkg)@\(v)"))"
+        case let .pipx(n): return "pipx install --force \(Shell.q("\(n)==\(v)"))"
+        case let .uv(n): return "uv tool install --force \(Shell.q("\(n)==\(v)"))"
+        case let .selfUpdate(path, _):
+            return installVersion.map { "\(Shell.q(path)) " + $0.replacingOccurrences(of: "{version}", with: v) }
+        default: return nil
+        }
+    }
+
+    var supportsRollback: Bool {
+        if case .macDirect = method { return true }
+        return rollbackCommand(to: "0").map { !$0.hasPrefix("sudo ") } ?? false
+    }
 
     /// Shell command shown to the user and run for the update (apps downloaded directly use `macInstallScript`).
     var command: String? {
@@ -132,7 +159,7 @@ enum Engine {
             guard let def = catalog.clis.first(where: { $0.id == r.id }) else { continue }
             let installed = r.packageVersion.isEmpty ? Version.extract(r.versionOutput) : r.packageVersion
             items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: false, path: r.path,
-                              installed: installed, method: cliMethod(r, def: def, os: p.os, installed: installed)))
+                              installed: installed, method: cliMethod(r, def: def, os: p.os, installed: installed), installVersion: def.installVersion))
         }
         for r in p.apps {
             guard let def = catalog.apps.first(where: { $0.id == r.id }),
@@ -222,7 +249,7 @@ enum Engine {
                 guard let info = item.latest, let url = info.url else {
                     return ShellResult(status: 1, stdout: "", stderr: "No download available")
                 }
-                script += macInstallScript(app: appPath, bundleID: bundleID, url: url, info: info, relaunch: relaunch)
+                script += macInstallScript(app: appPath, bundleID: bundleID, url: url, info: info, backup: backupPath(item), relaunch: relaunch)
             case let .cask(token):
                 if item.running { script += quitScript(bundleIDOf: item.path) }
                 script += "brew upgrade --cask \(Shell.q(token))\n"
@@ -233,6 +260,55 @@ enum Engine {
             }
         }
         return await Runner.run(item.machine, os: item.os, script: script, timeout: 900)
+    }
+
+    /// Puts back the version Update pls replaced. Mac apps come back from the copy kept at update time,
+    /// after checking it is the same app with a valid signature; other tools reinstall that exact version.
+    static func rollback(_ item: Item, to version: String, relaunch: Bool) async -> ShellResult {
+        var script = Probe.unixPrelude + "set -e\n"
+        if case let .macDirect(appPath, bundleID) = item.method {
+            script += macRollbackScript(app: appPath, bundleID: bundleID, backup: backupPath(item), relaunch: relaunch)
+        } else if let cmd = item.rollbackCommand(to: version) {
+            script += cmd + "\n"
+        } else {
+            return ShellResult(status: 1, stdout: "", stderr: "This install can't be rolled back")
+        }
+        return await Runner.run(item.machine, os: item.os, script: script, timeout: 900)
+    }
+
+    /// Where a Mac app's previous version is kept, relative to $HOME on its machine. One per app.
+    static func backupPath(_ item: Item) -> String {
+        "Library/Application Support/Update pls/Backups/\(item.defID)/\((item.path as NSString).lastPathComponent)"
+    }
+
+    /// Quits the app at $APP (bundle id $BID) if it is running and sets WAS_RUNNING.
+    static let quitIfRunning = """
+    WAS_RUNNING=0
+    ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null && WAS_RUNNING=1
+    if [ $WAS_RUNNING = 1 ]; then
+      osascript -e "tell application id \\"$BID\\" to quit" >/dev/null 2>&1 || true
+      for i in $(seq 1 60); do ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null || break; sleep 0.5; done
+      if ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null; then echo 'The app did not quit. Close it and try again.' >&2; exit 1; fi
+    fi
+
+    """
+
+    static func macRollbackScript(app: String, bundleID: String, backup: String, relaunch: Bool) -> String {
+        """
+        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); BK="$HOME/"\(Shell.q(backup))
+        [ -d "$BK" ] || { echo 'No saved previous version on this machine' >&2; exit 1; }
+        [ "$(defaults read "$BK/Contents/Info" CFBundleIdentifier)" = "$BID" ] || { echo 'Saved version has a different bundle id' >&2; exit 1; }
+        codesign --verify --deep --strict "$BK"
+        \(quitIfRunning)
+        T=$(mktemp -d /tmp/update-pls.XXXXXX)
+        mv "$APP" "$T/current.app"
+        if ! mv "$BK" "$APP"; then rm -rf "$APP"; mv "$T/current.app" "$APP"; echo 'Rollback failed, current version kept' >&2; exit 1; fi
+        rm -rf "$T"
+        echo "Rolled back to $(defaults read "$APP/Contents/Info" CFBundleShortVersionString)"
+        \(relaunch ? "[ $WAS_RUNNING = 1 ] && open \"$APP\"" : ":")
+        exit 0
+
+        """
     }
 
     static func quitScript(bundleIDOf appPath: String) -> String {
@@ -247,12 +323,12 @@ enum Engine {
 
     /// Downloads the publisher's build, checks its hash, signature, notarization and team,
     /// then swaps it in place of the installed app.
-    static func macInstallScript(app: String, bundleID: String, url: String, info: LatestInfo, relaunch: Bool) -> String {
+    static func macInstallScript(app: String, bundleID: String, url: String, info: LatestInfo, backup: String, relaunch: Bool) -> String {
         var verify = ""
         if let h = info.sha256 { verify = "[ \"$(shasum -a 256 \"$T/dl\" | cut -d' ' -f1)\" = \(Shell.q(h)) ] || { echo 'Checksum mismatch' >&2; exit 1; }" }
         else if let h = info.sha512Base64 { verify = "[ \"$(openssl dgst -sha512 -binary \"$T/dl\" | base64)\" = \(Shell.q(h)) ] || { echo 'Checksum mismatch' >&2; exit 1; }" }
         return """
-        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); URL=\(Shell.q(url))
+        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); URL=\(Shell.q(url)); BK="$HOME/"\(Shell.q(backup))
         T=$(mktemp -d /tmp/update-pls.XXXXXX)
         cleanup() { [ -d "$T/mnt" ] && hdiutil detach "$T/mnt" -quiet >/dev/null 2>&1; rm -rf "$T"; }
         trap cleanup EXIT
@@ -276,15 +352,11 @@ enum Engine {
         team() { codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p'; }
         OLD_TEAM=$(team "$APP"); NEW_TEAM=$(team "$NEW")
         [ -n "$NEW_TEAM" ] && [ "$NEW_TEAM" != "not set" ] && [ "$NEW_TEAM" = "$OLD_TEAM" ] || { echo "Signing team changed ($OLD_TEAM -> $NEW_TEAM)" >&2; exit 1; }
-        WAS_RUNNING=0
-        ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null && WAS_RUNNING=1
-        if [ $WAS_RUNNING = 1 ]; then
-          osascript -e "tell application id \\"$BID\\" to quit" >/dev/null 2>&1 || true
-          for i in $(seq 1 60); do ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null || break; sleep 0.5; done
-          if ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null; then echo 'The app did not quit. Close it and try again.' >&2; exit 1; fi
-        fi
-        mv "$APP" "$T/old.app"
-        if ! ditto "$NEW" "$APP"; then rm -rf "$APP"; mv "$T/old.app" "$APP"; echo 'Install failed, previous version restored' >&2; exit 1; fi
+        \(quitIfRunning)
+        # Keep the replaced version for rollback (one per app).
+        rm -rf "$BK"; mkdir -p "$(dirname "$BK")"
+        mv "$APP" "$BK"
+        if ! ditto "$NEW" "$APP"; then rm -rf "$APP"; mv "$BK" "$APP"; echo 'Install failed, previous version restored' >&2; exit 1; fi
         echo "Installed $(defaults read "$APP/Contents/Info" CFBundleShortVersionString)"
         \(relaunch ? "[ $WAS_RUNNING = 1 ] && open \"$APP\"" : ":")
         exit 0

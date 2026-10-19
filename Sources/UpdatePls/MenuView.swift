@@ -125,6 +125,9 @@ struct MachineSection: View {
 struct ItemRow: View {
     @EnvironmentObject var model: AppModel
     let item: Item
+    @State private var hovering = false
+
+    var skipped: Bool { model.excluded.contains(item.key) }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -135,13 +138,38 @@ struct ItemRow: View {
             }
             .help("\(item.path)\nvia \(item.method.label)")
             Spacer()
+            if skipped {
+                Button { model.toggleExcluded(item) } label: { Image(systemName: "pause.circle") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+                    .help("Skipped in Update all. Click to include it again.")
+            }
             action
+            Menu { menuItems } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .opacity(hovering ? 1 : 0).help("More")
         }
         .padding(.vertical, 2)
-        .contextMenu {
-            if let cmd = item.command { Button("Copy update command") { copy(cmd) } }
-            if !item.log.isEmpty { Button("Copy last output") { copy(item.log) } }
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .contextMenu { menuItems }
+    }
+
+    /// For long versions, only the part that changed: 0.1.1-nightly.20261019.3360 → 3373.
+    static func changedPart(of latest: String, from installed: String) -> String {
+        guard installed.count > 14 else { return latest }
+        let a = installed.split(separator: "."), b = latest.split(separator: ".")
+        let same = zip(a, b).prefix { $0 == $1 }.count
+        return same > 0 && same < b.count ? b[same...].joined(separator: ".") : latest
+    }
+
+    @ViewBuilder var menuItems: some View {
+        Button(skipped ? "Include in Update all" : "Skip in Update all") { model.toggleExcluded(item) }
+        if let v = model.rollbackVersion(item) {
+            Button("Roll back to \(v)…") { Task { await model.rollback(item) } }
         }
+        Divider()
+        if let cmd = item.command { Button("Copy update command") { copy(cmd) } }
+        if !item.log.isEmpty { Button("Copy last output") { copy(item.log) } }
     }
 
     /// Apps on this Mac show their real icon; everything else a symbol.
@@ -157,7 +185,7 @@ struct ItemRow: View {
         let installed = item.installed ?? "?"
         guard let latest = item.latest?.version else { return "\(installed) · latest unknown" }
         switch item.state {
-        case .available, .failed, .updating: return "\(installed) → \(latest)"
+        case .available, .failed, .updating: return "\(installed) → \(Self.changedPart(of: latest, from: installed))"
         default: return "\(installed) · latest"
         }
     }

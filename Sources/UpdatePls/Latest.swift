@@ -127,12 +127,20 @@ actor LatestResolver {
         return LatestInfo(version: String(text[r]))
     }
 
+    /// No local cache: a cached answer would hide new versions (it once kept reporting an old VERSION for hours).
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.urlCache = nil
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: c)
+    }()
+
     static func get(_ url: String, accept: String? = nil) async -> Data? {
         guard let u = URL(string: url) else { return nil }
-        var req = URLRequest(url: u, timeoutInterval: 20)
+        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         req.setValue("update-pls", forHTTPHeaderField: "User-Agent")
         if let accept { req.setValue(accept, forHTTPHeaderField: "Accept") }
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await session.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
         return data
     }

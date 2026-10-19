@@ -124,8 +124,9 @@ enum CLI {
         guard args.count >= 2 else { print("usage: UpdatePls update <host>/<tool-id> | all"); return 2 }
         let target = args[1]
         let results = await checkAll(machines(target == "all" ? [] : [String(target.split(separator: "/")[0])]))
+        let skipped = Set(UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
         let items = results.flatMap(\.1).filter { i in
-            target == "all" ? i.state == .available && i.canUpdate : "\(i.machine.id)/\(i.defID)" == target
+            target == "all" ? i.state == .available && i.canUpdate && !skipped.contains(i.key) : i.key == target
         }
         if items.isEmpty { print("Nothing to update"); return 0 }
         var code: Int32 = 0

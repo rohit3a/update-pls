@@ -24,6 +24,8 @@ struct CLIDef: Codable, Identifiable {
     var pypi: String?
     /// Arguments that make the tool update itself, e.g. "update".
     var selfUpdate: String?
+    /// Arguments that install one exact version, e.g. "install {version} --force". Enables rollback.
+    var installVersion: String?
     var latest: LatestSource?
 }
 
