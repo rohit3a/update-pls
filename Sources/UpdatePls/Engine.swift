@@ -282,13 +282,21 @@ enum Engine {
     }
 
     /// Quits the app at $APP (bundle id $BID) if it is running and sets WAS_RUNNING.
+    /// Quitting can set off the app's own updater (Squirrel's ShipIt) when it has an update waiting,
+    /// so this also waits for that to finish. ShipIt may reopen the app; callers decide what to do then.
     static let quitIfRunning = """
-    WAS_RUNNING=0
-    ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null && WAS_RUNNING=1
-    if [ $WAS_RUNNING = 1 ]; then
+    app_running() { ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null; }
+    quit_app() {
       osascript -e "tell application id \\"$BID\\" to quit" >/dev/null 2>&1 || true
-      for i in $(seq 1 60); do ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null || break; sleep 0.5; done
-      if ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null; then echo 'The app did not quit. Close it and try again.' >&2; exit 1; fi
+      for i in $(seq 1 60); do app_running || break; sleep 0.5; done
+      if app_running; then echo 'The app did not quit. Close it and try again.' >&2; exit 1; fi
+    }
+    WAS_RUNNING=0
+    if app_running; then
+      WAS_RUNNING=1
+      quit_app
+      sleep 1
+      for i in $(seq 1 240); do ps -axo command= | grep -F ShipIt | grep -F -e "$BID" -e "$APP/" | grep -v grep >/dev/null || break; sleep 0.5; done
     fi
 
     """
@@ -300,6 +308,7 @@ enum Engine {
         [ "$(defaults read "$BK/Contents/Info" CFBundleIdentifier)" = "$BID" ] || { echo 'Saved version has a different bundle id' >&2; exit 1; }
         codesign --verify --deep --strict "$BK"
         \(quitIfRunning)
+        app_running && quit_app
         T=$(mktemp -d /tmp/update-pls.XXXXXX)
         mv "$APP" "$T/current.app"
         if ! mv "$BK" "$APP"; then rm -rf "$APP"; mv "$T/current.app" "$APP"; echo 'Rollback failed, current version kept' >&2; exit 1; fi
@@ -328,7 +337,10 @@ enum Engine {
         if let h = info.sha256 { verify = "[ \"$(shasum -a 256 \"$T/dl\" | cut -d' ' -f1)\" = \(Shell.q(h)) ] || { echo 'Checksum mismatch' >&2; exit 1; }" }
         else if let h = info.sha512Base64 { verify = "[ \"$(openssl dgst -sha512 -binary \"$T/dl\" | base64)\" = \(Shell.q(h)) ] || { echo 'Checksum mismatch' >&2; exit 1; }" }
         return """
-        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); URL=\(Shell.q(url)); BK="$HOME/"\(Shell.q(backup))
+        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); URL=\(Shell.q(url)); BK="$HOME/"\(Shell.q(backup)); VER=\(Shell.q(info.version))
+        current() { defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true; }
+        # Many apps update themselves too; never redo (and restart for) an update that already happened.
+        if [ "$(current)" = "$VER" ]; then echo "Already on $VER"; exit 0; fi
         T=$(mktemp -d /tmp/update-pls.XXXXXX)
         cleanup() { [ -d "$T/mnt" ] && hdiutil detach "$T/mnt" -quiet >/dev/null 2>&1; rm -rf "$T"; }
         trap cleanup EXIT
@@ -352,7 +364,14 @@ enum Engine {
         team() { codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p'; }
         OLD_TEAM=$(team "$APP"); NEW_TEAM=$(team "$NEW")
         [ -n "$NEW_TEAM" ] && [ "$NEW_TEAM" != "not set" ] && [ "$NEW_TEAM" = "$OLD_TEAM" ] || { echo "Signing team changed ($OLD_TEAM -> $NEW_TEAM)" >&2; exit 1; }
+        if [ "$(current)" = "$VER" ]; then echo "Already on $VER"; exit 0; fi
         \(quitIfRunning)
+        if [ "$(current)" = "$VER" ]; then
+          echo "Already on $VER (the app installed its own update as it quit)"
+          \(relaunch ? "[ $WAS_RUNNING = 1 ] && ! app_running && open \"$APP\"" : ":")
+          exit 0
+        fi
+        app_running && quit_app
         # Keep the replaced version for rollback (one per app).
         rm -rf "$BK"; mkdir -p "$(dirname "$BK")"
         mv "$APP" "$BK"

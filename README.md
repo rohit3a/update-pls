@@ -36,7 +36,7 @@ Before a Mac app download replaces the installed app, Update pls checks:
 2. `codesign --verify` and `spctl` (Gatekeeper/notarization) pass.
 3. The bundle ID and the **signing team** are the same as the installed app's.
 
-If an app is open, it asks first, then quits it, updates it and reopens it.
+If an app is open, it asks first, then quits it, updates it and reopens it. Many apps also update themselves. Update pls checks the installed version again before it downloads and before it quits the app, and waits for the app's own updater if quitting sets it off. If the app is already on the new version, it isn't replaced or restarted a second time.
 
 Nothing is installed on your other machines. Checks and updates run over your existing SSH config with `BatchMode`, so password prompts are never answered.
 

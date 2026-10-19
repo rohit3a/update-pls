@@ -150,4 +150,25 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(ItemRow.changedPart(of: "0.1.1-nightly.20261020.3380", from: "0.1.1-nightly.20261019.3360"), "20261020.3380")
         XCTAssertEqual(ItemRow.changedPart(of: "2.1.304", from: "2.1.303"), "2.1.304")
     }
+
+    /// An app that already updated itself is left alone: no download, no quit.
+    func testMacInstallSkipsWhenAlreadyCurrent() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("up-skip-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: dir) }
+        let app = dir.appendingPathComponent("T.app")
+        try fm.createDirectory(at: app.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+        try (["CFBundleIdentifier": "com.example.t", "CFBundleShortVersionString": "3.0"] as NSDictionary)
+            .write(to: app.appendingPathComponent("Contents/Info.plist"))
+        let script = Engine.macInstallScript(app: app.path, bundleID: "com.example.t", url: "https://invalid.example/T.zip",
+                                             info: LatestInfo(version: "3.0"), backup: "x/T.app", relaunch: true)
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "set -e\n" + script]
+        p.environment = ["HOME": dir.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        p.standardOutput = out
+        try p.run(); p.waitUntilExit()
+        XCTAssertEqual(p.terminationStatus, 0)
+        XCTAssertTrue(String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).contains("Already on 3.0"))
+    }
 }

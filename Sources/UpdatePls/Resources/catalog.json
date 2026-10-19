@@ -3,7 +3,7 @@
     { "id": "claude-code", "name": "Claude Code", "brand": "Claude", "binaries": ["claude"], "npm": ["@anthropic-ai/claude-code"], "selfUpdate": "update", "installVersion": "install {version} --force", "latest": { "npm": "@anthropic-ai/claude-code" } },
     { "id": "codex", "name": "Codex CLI", "brand": "OpenAI", "binaries": ["codex"], "npm": ["@openai/codex"], "selfUpdate": "update", "latest": { "npm": "@openai/codex" } },
     { "id": "opencode", "name": "OpenCode", "brand": "OpenCode", "binaries": ["opencode"], "npm": ["opencode-ai", "@opencode/cli"], "selfUpdate": "upgrade", "latest": { "npm": "opencode-ai" } },
-    { "id": "t3", "name": "T3 Code CLI", "brand": "T3 Code", "binaries": ["t3"], "npm": ["t3"], "selfUpdate": "update", "latest": { "npm": "t3" } },
+    { "id": "t3", "name": "T3 Code CLI", "brand": "T3 Code", "binaries": ["t3"], "npm": ["t3"], "selfUpdate": "update --yes", "installVersion": "update {version} --allow-downgrade --yes", "latest": { "npm": "t3" } },
     { "id": "cursor-agent", "name": "Cursor Agent", "brand": "Cursor", "binaries": ["cursor-agent"], "selfUpdate": "update", "latest": { "scrape": { "url": "https://cursor.com/install", "regex": "downloads\\.cursor\\.com/lab/([^/\"]+)/" } } },
     { "id": "gemini", "name": "Gemini CLI", "brand": "Google", "binaries": ["gemini"], "npm": ["@google/gemini-cli"], "latest": { "npm": "@google/gemini-cli" } },
     { "id": "copilot", "name": "GitHub Copilot CLI", "brand": "GitHub", "binaries": ["copilot"], "npm": ["@github/copilot"], "latest": { "npm": "@github/copilot" } },

@@ -175,7 +175,8 @@ final class AppModel: ObservableObject {
         let result = await Engine.update(item, relaunch: true)
         let log = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
         if result.ok {
-            if item.supportsRollback, let v = item.installed { previous[item.key] = v }
+            // An app that had already updated itself leaves no saved copy to roll back to.
+            if item.supportsRollback, let v = item.installed, !log.contains("Already on") { previous[item.key] = v }
             // Confirm by reading the version again.
             await check(item.machine)
             if let fresh = items.first(where: { $0.id == item.id }) {
