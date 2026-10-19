@@ -10,6 +10,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/UpdatePls"
 cp Sources/UpdatePls/Resources/catalog.json "$APP/Contents/Resources/"
 VERSION=$(cat VERSION)
+# Lets the app update itself from this clone.
+SOURCE=""
+[ -d .git ] && SOURCE="<key>UpdatePlsSource</key><string>$(pwd)</string>"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -24,6 +27,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
+  $SOURCE
   <key>NSAppleEventsUsageDescription</key><string>Update pls asks apps to quit before it updates them.</string>
 </dict>
 </plist>

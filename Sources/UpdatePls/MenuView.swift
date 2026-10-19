@@ -2,18 +2,23 @@ import SwiftUI
 
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
+    @State private var listHeight: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            if model.selfUpdateAvailable || model.selfError != nil { selfUpdateRow; Divider() }
+            // A ScrollView has no height of its own in a menu bar window, so size it to its content.
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 14) {
                     ForEach(model.machines) { m in MachineSection(machine: m) }
                 }
                 .padding(12)
+                .background(GeometryReader { g in Color.clear.preference(key: HeightKey.self, value: g.size.height) })
             }
-            .frame(maxHeight: 520)
+            .frame(height: min(max(listHeight, 1), 560))
+            .onPreferenceChange(HeightKey.self) { listHeight = $0 }
             Divider()
             footer
         }
@@ -33,17 +38,42 @@ struct MenuView: View {
         .padding(12)
     }
 
+    var selfUpdateRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Update pls \(model.selfLatest ?? "") is out")
+                Text(model.selfError ?? "You have \(SelfUpdate.current)").font(.caption)
+                    .foregroundStyle(model.selfError == nil ? Color.secondary : Color.red).lineLimit(2)
+            }
+            Spacer()
+            if model.selfUpdating {
+                ProgressView().controlSize(.small).help("Building the new version…")
+            } else {
+                Button(SelfUpdate.source == nil ? "Download" : "Update") { Task { await model.updateSelf() } }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
     var footer: some View {
         HStack {
             if let d = model.lastCheck {
                 Text("Checked \(d.formatted(.relative(presentation: .named)))").font(.caption).foregroundStyle(.secondary)
             }
+            Text("v\(SelfUpdate.current)").font(.caption).foregroundStyle(.tertiary)
             Spacer()
             SettingsLink { Text("Settings…") }.buttonStyle(.borderless)
             Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.borderless)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
+}
+
+private struct HeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 struct MachineSection: View {
@@ -60,23 +90,20 @@ struct MachineSection: View {
                 Spacer()
                 statusLabel
             }
-            let list = model.items(for: machine)
-            if list.isEmpty, case .online = status?.state {
-                Text("No coding agents found").font(.caption).foregroundStyle(.secondary)
+            let groups = model.groups(for: machine)
+            if groups.isEmpty, case .online = status?.state {
+                Text("No coding tools found").font(.caption).foregroundStyle(.secondary)
             }
-            ForEach(list.filter { $0.state != .upToDate }) { ItemRow(item: $0) }
-            let current = list.filter { $0.state == .upToDate }
-            if !current.isEmpty {
-                DisclosureGroup(isExpanded: $showCurrent) {
-                    ForEach(current) { ItemRow(item: $0) }
-                } label: {
-                    Text("\(current.count) up to date").font(.caption).foregroundStyle(.secondary)
+            ForEach(Array(groups.enumerated()), id: \.element.brand) { i, g in
+                if i > 0 { Divider().padding(.leading, 24) }
+                // A brand with a CLI and an app (Claude Code + Claude Desktop) gets a header; single tools don't.
+                if g.items.count > 1 {
+                    Text(g.brand).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.leading, 24).padding(.top, 2)
                 }
+                ForEach(g.items) { ItemRow(item: $0) }
             }
         }
     }
-
-    @State private var showCurrent = false
 
     var icon: String {
         switch status?.os {
@@ -101,10 +128,10 @@ struct ItemRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: item.isApp ? "macwindow" : "terminal").frame(width: 16).foregroundStyle(.secondary)
+            icon.frame(width: 16, height: 16)
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.name).lineLimit(1)
-                Text(versionText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(versionText).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             .help("\(item.path)\nvia \(item.method.label)")
             Spacer()
@@ -117,10 +144,22 @@ struct ItemRow: View {
         }
     }
 
+    /// Apps on this Mac show their real icon; everything else a symbol.
+    @ViewBuilder var icon: some View {
+        if item.isApp && item.machine.isLocal {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: item.path)).resizable()
+        } else {
+            Image(systemName: item.isApp ? "macwindow" : "terminal").foregroundStyle(.secondary)
+        }
+    }
+
     var versionText: String {
         let installed = item.installed ?? "?"
-        guard let latest = item.latest?.version else { return installed }
-        return item.state == .available || item.isFailed ? "\(installed) → \(latest)" : installed
+        guard let latest = item.latest?.version else { return "\(installed) · latest unknown" }
+        switch item.state {
+        case .available, .failed, .updating: return "\(installed) → \(latest)"
+        default: return "\(installed) · latest"
+        }
     }
 
     @ViewBuilder var action: some View {

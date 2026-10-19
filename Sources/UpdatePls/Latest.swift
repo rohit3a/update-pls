@@ -20,6 +20,7 @@ actor LatestResolver {
         if let c = src.cask { return await cached("cask:\(c):\(arch)") { await self.cask(c, arch: arch) } }
         if let e = src.electronGithub { return await cached("eg:\(e.repo):\(e.channel):\(arch)") { await self.electron(e, arch: arch) } }
         if let s = src.scrape { return await cached("scrape:\(s.url)") { await self.scrape(s) } }
+        if let q = src.squirrel { return await cached("squirrel:\(q):\(arch)") { await self.squirrel(q, arch: arch) } }
         return nil
     }
 
@@ -109,6 +110,12 @@ actor LatestResolver {
             else if t.hasPrefix("sha512:"), let u = url, line.hasPrefix(" ") { files.append((u, value(Substring(t)))); url = nil }
         }
         return (version, files)
+    }
+
+    private func squirrel(_ template: String, arch: String) async -> LatestInfo? {
+        let url = template.replacingOccurrences(of: "{platform}", with: arch == "x86_64" ? "darwin-x64" : "darwin-arm64")
+        guard let j = await Self.json(url), let v = j["name"] as? String, let dl = j["url"] as? String else { return nil }
+        return LatestInfo(version: Version.clean(v), url: dl)
     }
 
     private func scrape(_ s: LatestSource.Scrape) async -> LatestInfo? {

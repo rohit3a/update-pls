@@ -1,34 +1,35 @@
 {
   "clis": [
-    { "id": "claude-code", "name": "Claude Code", "binaries": ["claude"], "npm": ["@anthropic-ai/claude-code"], "selfUpdate": "update", "latest": { "npm": "@anthropic-ai/claude-code" } },
-    { "id": "codex", "name": "Codex CLI", "binaries": ["codex"], "npm": ["@openai/codex"], "selfUpdate": "update", "latest": { "npm": "@openai/codex" } },
-    { "id": "opencode", "name": "OpenCode", "binaries": ["opencode"], "npm": ["opencode-ai", "@opencode/cli"], "selfUpdate": "upgrade", "latest": { "npm": "opencode-ai" } },
-    { "id": "t3", "name": "T3 Code CLI", "binaries": ["t3"], "npm": ["t3"], "selfUpdate": "update", "latest": { "npm": "t3" } },
-    { "id": "cursor-agent", "name": "Cursor Agent", "binaries": ["cursor-agent"], "selfUpdate": "update", "latest": { "scrape": { "url": "https://cursor.com/install", "regex": "downloads\\.cursor\\.com/lab/([^/\"]+)/" } } },
-    { "id": "gemini", "name": "Gemini CLI", "binaries": ["gemini"], "npm": ["@google/gemini-cli"], "latest": { "npm": "@google/gemini-cli" } },
-    { "id": "copilot", "name": "GitHub Copilot CLI", "binaries": ["copilot"], "npm": ["@github/copilot"], "latest": { "npm": "@github/copilot" } },
-    { "id": "amp", "name": "Amp", "binaries": ["amp"], "npm": ["@ampcode/cli", "@sourcegraph/amp"], "selfUpdate": "update", "latest": { "npm": "@ampcode/cli" } },
-    { "id": "droid", "name": "Factory Droid", "binaries": ["droid"], "npm": ["@factory/cli"], "latest": { "npm": "@factory/cli" } },
-    { "id": "qwen", "name": "Qwen Code", "binaries": ["qwen"], "npm": ["@qwen-code/qwen-code"], "latest": { "npm": "@qwen-code/qwen-code" } },
-    { "id": "crush", "name": "Crush", "binaries": ["crush"], "npm": ["@charmland/crush"], "latest": { "npm": "@charmland/crush" } },
-    { "id": "kilocode", "name": "Kilo Code CLI", "binaries": ["kilocode", "kilo"], "npm": ["@kilocode/cli"], "latest": { "npm": "@kilocode/cli" } },
-    { "id": "cline", "name": "Cline CLI", "binaries": ["cline"], "npm": ["cline"], "latest": { "npm": "cline" } },
-    { "id": "auggie", "name": "Auggie", "binaries": ["auggie"], "npm": ["@augmentcode/auggie"], "latest": { "npm": "@augmentcode/auggie" } },
-    { "id": "goose", "name": "Goose", "binaries": ["goose"], "selfUpdate": "update", "latest": { "github": "block/goose" } },
-    { "id": "agy", "name": "Antigravity CLI", "binaries": ["agy"] },
-    { "id": "aider", "name": "Aider", "binaries": ["aider"], "pypi": "aider-chat", "latest": { "pypi": "aider-chat" } }
+    { "id": "claude-code", "name": "Claude Code", "brand": "Claude", "binaries": ["claude"], "npm": ["@anthropic-ai/claude-code"], "selfUpdate": "update", "latest": { "npm": "@anthropic-ai/claude-code" } },
+    { "id": "codex", "name": "Codex CLI", "brand": "OpenAI", "binaries": ["codex"], "npm": ["@openai/codex"], "selfUpdate": "update", "latest": { "npm": "@openai/codex" } },
+    { "id": "opencode", "name": "OpenCode", "brand": "OpenCode", "binaries": ["opencode"], "npm": ["opencode-ai", "@opencode/cli"], "selfUpdate": "upgrade", "latest": { "npm": "opencode-ai" } },
+    { "id": "t3", "name": "T3 Code CLI", "brand": "T3 Code", "binaries": ["t3"], "npm": ["t3"], "selfUpdate": "update", "latest": { "npm": "t3" } },
+    { "id": "cursor-agent", "name": "Cursor Agent", "brand": "Cursor", "binaries": ["cursor-agent"], "selfUpdate": "update", "latest": { "scrape": { "url": "https://cursor.com/install", "regex": "downloads\\.cursor\\.com/lab/([^/\"]+)/" } } },
+    { "id": "gemini", "name": "Gemini CLI", "brand": "Google", "binaries": ["gemini"], "npm": ["@google/gemini-cli"], "latest": { "npm": "@google/gemini-cli" } },
+    { "id": "copilot", "name": "GitHub Copilot CLI", "brand": "GitHub", "binaries": ["copilot"], "npm": ["@github/copilot"], "latest": { "npm": "@github/copilot" } },
+    { "id": "amp", "name": "Amp", "brand": "Amp", "binaries": ["amp"], "npm": ["@ampcode/cli", "@sourcegraph/amp"], "selfUpdate": "update", "latest": { "npm": "@ampcode/cli" } },
+    { "id": "droid", "name": "Factory Droid", "brand": "Factory", "binaries": ["droid"], "npm": ["@factory/cli"], "latest": { "npm": "@factory/cli" } },
+    { "id": "qwen", "name": "Qwen Code", "brand": "Qwen", "binaries": ["qwen"], "npm": ["@qwen-code/qwen-code"], "latest": { "npm": "@qwen-code/qwen-code" } },
+    { "id": "crush", "name": "Crush", "brand": "Charm", "binaries": ["crush"], "npm": ["@charmland/crush"], "latest": { "npm": "@charmland/crush" } },
+    { "id": "kilocode", "name": "Kilo Code CLI", "brand": "Kilo Code", "binaries": ["kilocode", "kilo"], "npm": ["@kilocode/cli"], "latest": { "npm": "@kilocode/cli" } },
+    { "id": "cline", "name": "Cline CLI", "brand": "Cline", "binaries": ["cline"], "npm": ["cline"], "latest": { "npm": "cline" } },
+    { "id": "auggie", "name": "Auggie", "brand": "Augment", "binaries": ["auggie"], "npm": ["@augmentcode/auggie"], "latest": { "npm": "@augmentcode/auggie" } },
+    { "id": "goose", "name": "Goose", "brand": "Goose", "binaries": ["goose"], "selfUpdate": "update", "latest": { "github": "block/goose" } },
+    { "id": "agy", "name": "Antigravity CLI", "brand": "Google", "binaries": ["agy"] },
+    { "id": "aider", "name": "Aider", "brand": "Aider", "binaries": ["aider"], "pypi": "aider-chat", "latest": { "pypi": "aider-chat" } }
   ],
   "apps": [
-    { "id": "claude-desktop", "name": "Claude Desktop", "mac": [{ "app": "Claude", "latest": { "cask": "claude" } }], "windows": ["Claude"] },
-    { "id": "codex-app", "name": "Codex App", "mac": [{ "app": "Codex", "latest": { "cask": "codex-app" } }, { "app": "ChatGPT", "latest": { "cask": "chatgpt" } }], "windows": ["Codex", "ChatGPT"] },
-    { "id": "cursor", "name": "Cursor", "mac": [{ "app": "Cursor", "latest": { "cask": "cursor" } }], "windows": ["Cursor"], "linuxDeb": ["cursor"] },
-    { "id": "antigravity", "name": "Antigravity", "mac": [{ "app": "Antigravity", "latest": { "cask": "antigravity" } }], "windows": ["Antigravity"], "linuxDeb": ["antigravity"] },
-    { "id": "t3code", "name": "T3 Code", "mac": [
+    { "id": "claude-desktop", "name": "Claude Desktop", "brand": "Claude", "mac": [{ "app": "Claude", "latest": { "cask": "claude" } }], "windows": ["Claude"] },
+    { "id": "codex-app", "name": "Codex App", "brand": "OpenAI", "mac": [{ "app": "Codex", "latest": { "cask": "codex-app" } }, { "app": "ChatGPT", "latest": { "cask": "chatgpt" } }], "windows": ["Codex", "ChatGPT"] },
+    { "id": "cursor", "name": "Cursor", "brand": "Cursor", "mac": [{ "app": "Cursor", "latest": { "cask": "cursor" } }], "windows": ["Cursor"], "linuxDeb": ["cursor"] },
+    { "id": "antigravity", "name": "Antigravity", "brand": "Google", "mac": [{ "app": "Antigravity", "latest": { "cask": "antigravity" } }], "windows": ["Antigravity"], "linuxDeb": ["antigravity"] },
+    { "id": "t3code", "name": "T3 Code", "brand": "T3 Code", "mac": [
         { "app": "T3 Code (Nightly)", "latest": { "electronGithub": { "repo": "pingdotgg/t3code", "channel": "nightly" } } },
         { "app": "T3 Code (Beta)", "latest": { "cask": "t3-code" } },
         { "app": "T3 Code", "latest": { "cask": "t3-code" } }
       ], "windows": ["T3 Code"] },
-    { "id": "kiro", "name": "Kiro", "mac": [{ "app": "Kiro", "latest": { "cask": "kiro" } }], "windows": ["Kiro"] },
-    { "id": "zed", "name": "Zed", "mac": [{ "app": "Zed", "latest": { "cask": "zed" } }], "windows": ["Zed"] }
+    { "id": "kiro", "name": "Kiro", "brand": "Kiro", "mac": [{ "app": "Kiro", "latest": { "cask": "kiro" } }], "windows": ["Kiro"] },
+    { "id": "grok-bot", "name": "Grok Bot", "brand": "Grok", "mac": [{ "app": "Grok Bot", "latest": { "squirrel": "https://api2.cursor.sh/updates/api/update/{platform}/sand/0.0.1/0/stable" } }] },
+    { "id": "zed", "name": "Zed", "brand": "Zed", "mac": [{ "app": "Zed", "latest": { "cask": "zed" } }], "windows": ["Zed"] }
   ]
 }

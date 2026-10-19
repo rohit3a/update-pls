@@ -18,7 +18,7 @@ struct UpdatePlsApp: App {
         MenuBarExtra {
             MenuView().environmentObject(model)
         } label: {
-            let n = model.available.count
+            let n = model.updateCount
             Image(systemName: n > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
             if n > 0 { Text("\(n)") }
         }
@@ -61,6 +61,7 @@ enum CLI {
 
     static func main(_ args: [String]) async -> Int32 {
         if args[0] == "check" {
+            print("Update pls \(SelfUpdate.current) (latest \(await SelfUpdate.latest() ?? "?"))")
             for (status, items) in await checkAll(machines(Array(args.dropFirst()))) {
                 switch status.state {
                 case let .offline(msg): print("\(status.machine.id): offline (\(msg))"); continue

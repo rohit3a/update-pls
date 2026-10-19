@@ -9,6 +9,9 @@ final class AppModel: ObservableObject {
     @Published var items: [Item] = []
     @Published var isChecking = false
     @Published var lastCheck: Date?
+    @Published var selfLatest: String?
+    @Published var selfUpdating = false
+    @Published var selfError: String?
     @Published var hosts: [String] = SSHConfig.hosts()
     @Published var disabledHosts: Set<String> {
         didSet { UserDefaults.standard.set(Array(disabledHosts), forKey: "disabledHosts") }
@@ -34,6 +37,18 @@ final class AppModel: ObservableObject {
 
     var available: [Item] { items.filter { $0.state == .available && $0.canUpdate } }
 
+    var selfUpdateAvailable: Bool { selfLatest.map { Version.isNewer($0, than: SelfUpdate.current) } ?? false }
+
+    /// Badge count in the menu bar: tool updates plus Update pls itself.
+    var updateCount: Int { available.count + (selfUpdateAvailable ? 1 : 0) }
+
+    /// A machine's items grouped by brand (Claude, OpenAI, Google, ...), brands in alphabetical order.
+    func groups(for m: Machine) -> [(brand: String, items: [Item])] {
+        Dictionary(grouping: items(for: m), by: \.brand)
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .map { (brand: $0.key, items: $0.value.sorted { ($0.isApp ? 1 : 0, $0.name) < ($1.isApp ? 1 : 0, $1.name) }) }
+    }
+
     func items(for m: Machine) -> [Item] {
         items.filter { $0.machine == m }.sorted { ($0.state.sortKey, $0.name) < ($1.state.sortKey, $1.name) }
     }
@@ -56,6 +71,7 @@ final class AppModel: ObservableObject {
         let catalog = Catalog.load()
         let resolver = LatestResolver()
         let machines = machines
+        async let selfLatest = SelfUpdate.latest()
         statuses = machines.map { m in
             var s = statuses.first { $0.machine == m } ?? MachineStatus(machine: m)
             s.state = .checking
@@ -67,6 +83,7 @@ final class AppModel: ObservableObject {
             }
         }
         items.removeAll { item in !machines.contains(item.machine) }
+        self.selfLatest = await selfLatest ?? self.selfLatest
         lastCheck = Date()
         isChecking = false
         notifyNewUpdates()
@@ -98,6 +115,12 @@ final class AppModel: ObservableObject {
                 group.addTask { for item in list { await self.runUpdate(item) } }
             }
         }
+    }
+
+    func updateSelf() async {
+        selfUpdating = true
+        selfError = await SelfUpdate.update()
+        selfUpdating = false
     }
 
     private func runUpdate(_ item: Item) async {

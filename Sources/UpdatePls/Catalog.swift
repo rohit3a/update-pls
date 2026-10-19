@@ -10,11 +10,15 @@ struct LatestSource: Codable, Hashable {
     var cask: String?
     var electronGithub: ElectronFeed?
     var scrape: Scrape?
+    /// Squirrel.Mac update endpoint answering {url, name}; "{platform}" becomes darwin-arm64 or darwin-x64.
+    var squirrel: String?
 }
 
 struct CLIDef: Codable, Identifiable {
     var id: String
     var name: String
+    /// Groups a company's CLI and apps under one header, e.g. "Claude".
+    var brand: String?
     var binaries: [String]
     var npm: [String]?
     var pypi: String?
@@ -31,6 +35,7 @@ struct MacVariant: Codable {
 struct AppDef: Codable, Identifiable {
     var id: String
     var name: String
+    var brand: String?
     var mac: [MacVariant]?
     var windows: [String]?
     var linuxDeb: [String]?

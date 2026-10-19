@@ -40,6 +40,7 @@ struct Item: Identifiable, Hashable {
     var os: OSKind
     var defID: String
     var name: String
+    var brand: String
     var isApp: Bool
     var path: String
     var installed: String?
@@ -130,7 +131,7 @@ enum Engine {
         for r in p.clis {
             guard let def = catalog.clis.first(where: { $0.id == r.id }) else { continue }
             let installed = r.packageVersion.isEmpty ? Version.extract(r.versionOutput) : r.packageVersion
-            items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, isApp: false, path: r.path,
+            items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: false, path: r.path,
                               installed: installed, method: cliMethod(r, def: def, os: p.os, installed: installed)))
         }
         for r in p.apps {
@@ -139,13 +140,13 @@ enum Engine {
             let method: Method = if let t = variant.latest.cask, p.hasBrew, p.casks.contains(t) { .cask(t) }
                                  else { .macDirect(appPath: r.path, bundleID: r.bundleID) }
             let name = def.mac!.count == 1 ? def.name : r.appName.hasPrefix(def.name) ? r.appName : "\(def.name) (\(r.appName))"
-            items.append(Item(machine: machine, os: p.os, defID: def.id, name: name, isApp: true, path: r.path,
+            items.append(Item(machine: machine, os: p.os, defID: def.id, name: name, brand: def.brand ?? def.name, isApp: true, path: r.path,
                               installed: r.version, method: method, running: r.running))
         }
         for r in p.debs {
             guard let def = catalog.apps.first(where: { $0.id == r.id }) else { continue }
             let candidate = r.candidate.isEmpty || r.candidate == "(none)" ? r.installed : r.candidate
-            items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, isApp: true, path: r.package,
+            items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: true, path: r.package,
                               installed: r.installed, latest: LatestInfo(version: candidate), method: .deb(r.package)))
         }
         for def in catalog.apps {
@@ -155,7 +156,7 @@ enum Engine {
                         || $0.id.split(separator: ".").last.map(String.init)?.caseInsensitiveCompare(want.replacingOccurrences(of: " ", with: "")) == .orderedSame
                 }) else { continue }
                 let managed = !row.id.contains("\\") && row.id.contains(".")
-                items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, isApp: true, path: row.id,
+                items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: true, path: row.id,
                                   installed: row.version,
                                   latest: managed ? LatestInfo(version: row.available.isEmpty ? row.version : row.available) : nil,
                                   method: managed ? .winget(row.id) : .none))
