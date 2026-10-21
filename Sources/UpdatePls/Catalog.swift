@@ -118,8 +118,9 @@ enum Version {
 
     static func compare(_ a: String, _ b: String) -> ComparisonResult {
         func split(_ v: String) -> ([Int], [String]) {
-            let parts = v.split(separator: "-", maxSplits: 1).map(String.init)
-            let core = parts[0].split(separator: ".").map { Int($0) ?? 0 }
+            // Never index blindly: an app caught mid-install can report "" or "-" as its version.
+            let parts = v.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let core = (parts.first ?? "").split(separator: ".").map { Int($0) ?? 0 }
             let pre = parts.count > 1 ? parts[1].split(separator: ".").map(String.init) : []
             return (core, pre)
         }

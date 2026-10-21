@@ -16,6 +16,12 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(Version.isNewer("2026.10.16-e3cb207", than: "2026.10.01-e373342"))
         XCTAssertTrue(Version.isNewer("1.0.0", than: "1.0.0-beta.2"))
         XCTAssertFalse(Version.isNewer("v0.163.0", than: "0.163.0"))
+        // Versions read from an app mid-install must not crash the comparison.
+        for odd in ["", "-", "v", "-beta", "1.0-"] {
+            _ = Version.isNewer(odd, than: "1.0.0")
+            _ = Version.isNewer("1.0.0", than: odd)
+        }
+        XCTAssertFalse(Version.isNewer("", than: ""))
         XCTAssertEqual(Version.channel("0.1.1-nightly.2026"), "nightly")
         XCTAssertNil(Version.channel("2026.10.01-e373342".replacingOccurrences(of: "e", with: "1")))
     }

@@ -149,7 +149,8 @@ enum Engine {
     }
 
     static func state(_ item: Item) -> ItemState {
-        guard let latest = item.latest?.version, let installed = item.installed else { return .unknown }
+        guard let latest = item.latest?.version, let installed = item.installed,
+              !Version.clean(latest).isEmpty, !Version.clean(installed).isEmpty else { return .unknown }
         return Version.isNewer(latest, than: installed) ? .available : .upToDate
     }
 
