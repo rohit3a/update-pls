@@ -20,6 +20,10 @@ final class AppModel: ObservableObject {
     @Published var excluded: Set<String> {
         didSet { UserDefaults.standard.set(Array(excluded), forKey: "excludedFromUpdateAll") }
     }
+    /// Tools (`machine/tool`) left out of the list altogether.
+    @Published var hidden: Set<String> {
+        didSet { UserDefaults.standard.set(Array(hidden), forKey: "hiddenTools") }
+    }
     /// The version each tool (`machine/tool`) was on before Update pls last updated it, for rollback.
     @Published var previous: [String: String] {
         didSet { UserDefaults.standard.set(previous, forKey: "previousVersions") }
@@ -34,6 +38,7 @@ final class AppModel: ObservableObject {
     init() {
         disabledHosts = Set(UserDefaults.standard.stringArray(forKey: "disabledHosts") ?? [])
         excluded = Set(UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
+        hidden = Set(UserDefaults.standard.stringArray(forKey: "hiddenTools") ?? [])
         previous = UserDefaults.standard.dictionary(forKey: "previousVersions") as? [String: String] ?? [:]
         let h = UserDefaults.standard.double(forKey: "intervalHours")
         intervalHours = h > 0 ? h : 3
@@ -46,7 +51,15 @@ final class AppModel: ObservableObject {
         [Machine.local] + hosts.filter { !disabledHosts.contains($0) }.map { Machine(id: $0, name: $0) }
     }
 
-    var available: [Item] { items.filter { $0.state == .available && $0.canUpdate && !excluded.contains($0.key) } }
+    var available: [Item] {
+        items.filter { $0.state == .available && $0.canUpdate && !excluded.contains($0.key) && !hidden.contains($0.key) }
+    }
+
+    /// "Cursor on rog-workstation" for a hidden tool's key, for Settings.
+    func label(forKey key: String) -> String {
+        guard let i = items.first(where: { $0.key == key }) else { return key }
+        return i.machine.isLocal ? i.name : "\(i.name) on \(i.machine.name)"
+    }
 
     func toggleExcluded(_ item: Item) {
         if excluded.contains(item.key) { excluded.remove(item.key) } else { excluded.insert(item.key) }
@@ -90,7 +103,7 @@ final class AppModel: ObservableObject {
     }
 
     func items(for m: Machine) -> [Item] {
-        items.filter { $0.machine == m }.sorted { ($0.state.sortKey, $0.name) < ($1.state.sortKey, $1.name) }
+        items.filter { $0.machine == m && !hidden.contains($0.key) }.sorted { ($0.state.sortKey, $0.name) < ($1.state.sortKey, $1.name) }
     }
 
     /// Background checks through macOS's activity scheduler, which picks an energy-friendly moment

@@ -164,6 +164,7 @@ struct ItemRow: View {
 
     @ViewBuilder var menuItems: some View {
         Button(skipped ? "Include in Update all" : "Skip in Update all") { model.toggleExcluded(item) }
+        Button("Hide from list") { model.hidden.insert(item.key) }
         if let v = model.rollbackVersion(item) {
             Button("Roll back to \(v)…") { Task { await model.rollback(item) } }
         }
@@ -234,6 +235,17 @@ struct SettingsView: View {
                     Toggle(h, isOn: Binding(
                         get: { !model.disabledHosts.contains(h) },
                         set: { on in if on { model.disabledHosts.remove(h) } else { model.disabledHosts.insert(h) } }))
+                }
+            }
+            if !model.hidden.isEmpty {
+                Section("Hidden tools") {
+                    ForEach(model.hidden.sorted(), id: \.self) { key in
+                        HStack {
+                            Text(model.label(forKey: key))
+                            Spacer()
+                            Button("Show") { model.hidden.remove(key) }
+                        }
+                    }
                 }
             }
             Section("General") {

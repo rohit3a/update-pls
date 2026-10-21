@@ -7,6 +7,9 @@ enum Main {
         if args.first == "check" || args.first == "update" {
             exit(CLI.run(args))
         }
+        // With no saved position, macOS puts a new menu bar icon at the far left, which on a full menu bar
+        // with a notch means hidden. Default to a spot near the system icons; dragging it still overrides this.
+        UserDefaults.standard.register(defaults: ["NSStatusItem Preferred Position Item-0": 400])
         UpdatePlsApp.main()
     }
 }
@@ -124,7 +127,8 @@ enum CLI {
         guard args.count >= 2 else { print("usage: UpdatePls update <host>/<tool-id> | all"); return 2 }
         let target = args[1]
         let results = await checkAll(machines(target == "all" ? [] : [String(target.split(separator: "/")[0])]))
-        let skipped = Set(UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
+        let skipped = Set((UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
+            + (UserDefaults.standard.stringArray(forKey: "hiddenTools") ?? []))
         let items = results.flatMap(\.1).filter { i in
             target == "all" ? i.state == .available && i.canUpdate && !skipped.contains(i.key) : i.key == target
         }

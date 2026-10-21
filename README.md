@@ -67,6 +67,7 @@ The app binary doubles as a CLI:
 Hover a tool and click **⋯** (or right-click it):
 
 - **Skip in Update all** leaves that tool alone when you press Update all, and leaves it out of the count on the icon. You can still update it on its own. A ⏸ marks skipped tools; click it to include the tool again.
+- **Hide from list** removes a tool you don't care about from the menu (and from Update all). Settings → **Hidden tools** brings it back.
 - **Roll back to …** puts back the version Update pls replaced:
   - Mac apps come back from the copy kept when they were updated (one per app, in `~/Library/Application Support/Update pls/Backups`). The copy is checked first: same bundle ID and a valid signature. If the swap fails, the current version stays.
   - npm, bun, pipx and uv tools, and Claude Code, reinstall that exact version.
