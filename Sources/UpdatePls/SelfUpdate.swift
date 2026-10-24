@@ -15,7 +15,8 @@ enum SelfUpdate {
     }
 
     static func latest() async -> String? {
-        guard let d = await LatestResolver.get("https://raw.githubusercontent.com/\(repo)/main/VERSION") else { return nil }
+        // Through the API: raw.githubusercontent.com's CDN can keep serving an old VERSION for hours.
+        guard let d = await LatestResolver.get("https://api.github.com/repos/\(repo)/contents/VERSION", accept: "application/vnd.github.raw") else { return nil }
         let v = String(decoding: d, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         return Version.extract(v)
     }
