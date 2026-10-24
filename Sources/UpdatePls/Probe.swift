@@ -56,16 +56,46 @@ enum Probe {
     /// `up_deb_running pkg`: whether a desktop app installed by that apt package is open. It looks for programs
     /// right in the package's own folder (/usr/lib/chatgpt, /opt/Grok Bot, ...), not helpers in subfolders.
     static let debFunctions = #"""
-    up_deb_running() {
+    up_deb_pids() {
       d=$(dpkg -L "$1" 2>/dev/null | grep -E '^/(opt|usr/lib|usr/share)/[^/]+$' \
         | grep -v -E '^/usr/share/(doc|applications|icons|pixmaps|man|lintian|mime|metainfo|appdata|swcatalog|bash-completion|zsh|fish|polkit-1|menu)$' \
         | while IFS= read -r x; do if [ -d "$x" ]; then echo "$x"; fi; done | head -1)
-      [ -n "$d" ] || return 1
+      [ -n "$d" ] || return 0
       for e in /proc/[0-9]*/exe; do
         x=$(readlink "$e" 2>/dev/null) || continue
-        case "$x" in "$d"/*/*) ;; "$d"/*) return 0 ;; esac
+        case "$x" in "$d"/*/*) ;; "$d"/*) p=${e#/proc/}; echo "${p%/exe}" ;; esac
       done
+    }
+    up_deb_running() { [ -n "$(up_deb_pids "$1")" ]; }
+
+    """#
+
+    /// `up_deb_quit pkg dir` asks an open app to quit as closing its windows would (SIGTERM to its top processes,
+    /// never SIGKILL) and fails if it is still open after 30 seconds. It first saves the desktop session's
+    /// environment in dir, so `up_deb_open pkg dir` can start the app again there, as its menu entry would.
+    static let debQuitFunctions = #"""
+    up_deb_quit() {
+      all=" $(up_deb_pids "$1" | tr '\n' ' ') "
+      top=""
+      for p in $all; do
+        pp=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$p/status" 2>/dev/null)
+        case "$all" in *" $pp "*) ;; *) top="$top $p" ;; esac
+      done
+      for e in $(for p in $top; do echo "/proc/$p/environ"; done) /proc/[0-9]*/environ; do
+        if [ -O "$e" ] && tr '\0' '\n' < "$e" 2>/dev/null | grep -q -E '^(WAYLAND_DISPLAY|DISPLAY)='; then
+          tr '\0' '\n' < "$e" | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_[A-Z_]+|DBUS_SESSION_BUS_ADDRESS|DESKTOP_SESSION|HOME|USER|LANG|PATH)=' > "$2/env"
+          break
+        fi
+      done
+      if [ -n "$top" ]; then kill -TERM $top 2>/dev/null || true; fi
+      for i in $(seq 1 60); do up_deb_running "$1" || return 0; sleep 0.5; done
       return 1
+    }
+    up_deb_open() {
+      f=$(dpkg -L "$1" 2>/dev/null | grep -E '^/usr/share/applications/[^/]+\.desktop$' | head -1)
+      [ -n "$f" ] && [ -s "$2/env" ] && command -v gio >/dev/null 2>&1 || return 1
+      mapfile -t envs < "$2/env"
+      setsid -f env "${envs[@]}" gio launch "$f" </dev/null >/dev/null 2>&1
     }
 
     """#

@@ -177,7 +177,9 @@ final class UpdatePlsTests: XCTestCase {
             Engine.macKeepCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app), keep: 3),
             Engine.macRecoverScript(marker: Engine.swapMarkerPath(app)),
             Probe.unixScript(Catalog.bundled()),
-            Probe.debFunctions + "up_deb_running chatgpt || true\n",
+            Engine.commandScript(Item(machine: Machine(id: "rog", name: "rog"), os: .linux, defID: "codex-app", name: "ChatGPT", brand: "OpenAI",
+                                      isApp: true, path: "chatgpt", method: .deb("chatgpt", passwordless: true)),
+                                 "sudo -n apt-get install --only-upgrade -y chatgpt", relaunch: true),
         ] {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -780,6 +782,8 @@ final class UpdatePlsTests: XCTestCase {
         model.enqueue([(a, .update)])
         model.updateAll()
         XCTAssertTrue(model.isActive(a) && model.isActive(b))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(model.queuedMessage(b), "Waiting for A to finish…", "a queued row says what it waits for")
         XCTAssertTrue(model.updatable.isEmpty, "nothing queued can be started again")
         XCTAssertTrue(model.keepsAwake)
         for _ in 0..<50 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }

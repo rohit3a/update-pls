@@ -28,7 +28,7 @@ Each tool is updated the same way it was installed:
 | pipx / uv / bun | `pipx upgrade` / `uv tool upgrade` / `bun add -g` |
 | Mac app download | the publisher's build, checked before it replaces the app (see below) |
 | winget (Windows) | `winget upgrade --id ...` |
-| apt (Linux) | `apt-get install --only-upgrade` when sudo works without a password there (its package lists are refreshed first if they are over 12 hours old); otherwise a **Copy sudo command** button. An app that is open there is left alone, with a message to quit it first |
+| apt (Linux) | `apt-get install --only-upgrade` when sudo works without a password there (its package lists are refreshed first if they are over 12 hours old); otherwise a **Copy sudo command** button. An app that is open there is downloaded first, then quit (after asking), updated and opened again there |
 
 Before a Mac app download replaces the installed app, Update pls checks:
 

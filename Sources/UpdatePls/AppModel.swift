@@ -289,6 +289,19 @@ final class AppModel: ObservableObject {
 
     func dismiss(_ item: Item) { if !isActive(item) { activity[item.key] = nil } }
 
+    /// What a queued job is waiting for: a check of its machine, or the job running there (one at a time per machine).
+    func queuedMessage(_ item: Item) -> String {
+        if scanning.contains(item.machine) { return "Waiting for the check to finish…" }
+        for other in items where other.machine == item.machine && other.key != item.key {
+            switch activity[other.key] {
+            case .running?: return "Waiting for \(other.name) to finish…"
+            case .checking?: return "Waiting for the version check…"
+            default: continue
+            }
+        }
+        return "Waiting to update…"
+    }
+
     /// Runs a failed job again: the same update, or the same switch to another version (already confirmed once).
     func retry(_ item: Item) {
         guard let job = lastJob[item.key], case .install = job else { return update(item) }
@@ -406,11 +419,7 @@ final class AppModel: ObservableObject {
 
     /// One prompt listing the open apps an update will quit and reopen, with "Don't ask again".
     private func confirmQuit(_ targets: [Item]) -> Bool {
-        // apt apps aren't quit (an open one stops with a message instead), so they aren't listed.
-        let open = targets.filter { t in
-            if case .deb = t.method { return false }
-            return t.isApp && (t.machine.isLocal ? !LocalApps.instances(t.path).isEmpty : t.running)
-        }
+        let open = targets.filter { t in t.isApp && (t.machine.isLocal ? !LocalApps.instances(t.path).isEmpty : t.running) }
         guard !open.isEmpty, askBeforeQuitting else { return true }
         let alert = NSAlert()
         alert.messageText = open.count == 1 ? "\(open[0].name) is open" : "\(open.count) apps are open"

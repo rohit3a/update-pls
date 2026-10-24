@@ -267,7 +267,7 @@ extension Engine {
         case _ where dryRun:
             outcome = UpdateOutcome(ok: true, message: "Would run: \(item.command ?? "nothing") (dry run, nothing installed)", changed: false)
         case .cask where item.os == .mac: outcome = await updateCask(item, relaunch: relaunch, r)
-        default: outcome = await runCommand(item, r)
+        default: outcome = await runCommand(item, r, relaunch: relaunch)
         }
         finish(item, "update", &outcome, start)
         return outcome
@@ -351,7 +351,7 @@ extension Engine {
     }
 
     /// CLIs and everything that has a single command: npm, brew, pipx, uv, bun, built-in updaters, winget.
-    static func runCommand(_ item: Item, _ r: Reporter) async -> UpdateOutcome {
+    static func runCommand(_ item: Item, _ r: Reporter, relaunch: Bool = true) async -> UpdateOutcome {
         var item = item
         if case let .npm(bin, prefix, pkg, _, w) = item.method {
             // Install the exact version we found, so nightly users stay on nightly.
@@ -364,16 +364,7 @@ extension Engine {
         r.showLines = true
         r.phase("Updating with \(item.method.label)")
         if let f = r.runFile { Log.appendRun(f, "$ \(cmd)\n") }
-        // apt would replace an open app's files under it; there is no clean way to quit it from here.
-        var guardOpen = ""
-        if case let .deb(pkg, _) = item.method {
-            let msg = "\(item.name) is open on \(item.machine.name). Quit it there and press Retry."
-            guardOpen = Probe.debFunctions + "if up_deb_running \(Shell.q(pkg)); then echo \(Shell.q("UPFAIL " + msg)) >&2; exit 1; fi\n"
-        }
-        let script = item.os == .windows
-            ? Probe.windowsPrelude + cmd + "\nexit $LASTEXITCODE\n"
-            : Probe.unixPrelude + guardOpen + "set -e\n" + cmd + "\n"
-        let res = await Runner.run(item.machine, os: item.os, script: script, timeout: 900, onOutput: r.sink)
+        let res = await Runner.run(item.machine, os: item.os, script: commandScript(item, cmd, relaunch: relaunch), timeout: 900, onOutput: r.sink)
         guard res.ok else {
             var o = UpdateOutcome.fail(failure(res), output: res.combined)
             o.timedOut = res.timedOut
@@ -381,6 +372,45 @@ extension Engine {
         }
         return UpdateOutcome(ok: true, message: "Updated", output: res.combined,
                              previous: item.supportsRollback ? item.installed : nil)
+    }
+
+    static func commandScript(_ item: Item, _ cmd: String, relaunch: Bool) -> String {
+        // apt would replace an open app's files under it. As with Mac apps, it is downloaded while the app keeps
+        // running, then quit there, updated and opened again (whether or not the update worked).
+        var before = "", after = ""
+        if case let .deb(pkg, _) = item.method {
+            let p = Shell.q(pkg), on = item.machine.name
+            before = Probe.debFunctions + Probe.debQuitFunctions + """
+            UP_RL=$(mktemp -d); UP_OPEN=0
+            if up_deb_running \(p); then
+              echo \(Shell.q("==> Downloading \(item.name)"))
+              if ! { sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y --download-only \(p); }; then
+                rm -rf "$UP_RL"; exit 1
+              fi
+              echo \(Shell.q("==> Quitting \(item.name) on \(on)"))
+              if ! up_deb_quit \(p) "$UP_RL"; then
+                rm -rf "$UP_RL"
+                echo \(Shell.q("UPFAIL \(item.name) didn't quit on \(on). It may be asking you something there; quit it and press Retry.")) >&2
+                exit 1
+              fi
+              UP_OPEN=\(relaunch ? 1 : 0)
+              echo \(Shell.q("==> Installing \(item.name)"))
+            fi
+
+            """
+            after = """
+            if [ $UP_OPEN = 1 ]; then
+              echo \(Shell.q("==> Reopening \(item.name)"))
+              up_deb_open \(p) "$UP_RL" || echo \(Shell.q("Couldn't reopen \(item.name) on \(on); open it there.")) >&2
+            fi
+            rm -rf "$UP_RL"
+
+            """
+        }
+        return item.os == .windows
+            ? Probe.windowsPrelude + cmd + "\nexit $LASTEXITCODE\n"
+            : after.isEmpty ? Probe.unixPrelude + "set -e\n" + cmd + "\n"
+            : Probe.unixPrelude + before + "(\nset -e\n" + cmd + "\n)\nUP_ST=$?\n" + after + "exit $UP_ST\n"
     }
 
     // MARK: Mac apps

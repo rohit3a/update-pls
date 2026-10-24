@@ -184,7 +184,7 @@ struct ItemRow: View {
     @ViewBuilder var detail: some View {
         switch activity {
         case .queued?:
-            Text("Waiting to update…").font(.caption).foregroundStyle(.secondary)
+            Text(model.queuedMessage(item)).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
         case let .running(phase, fraction)?:
             Text(fraction.map { "\(phase) · \(Int($0 * 100))%" } ?? (phase.hasSuffix(".") ? phase : "\(phase)…"))
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
