@@ -145,10 +145,12 @@ enum CLI {
                 case let .offline(msg): print("\(status.machine.id): offline (\(msg))"); continue
                 default: print("\(status.machine.id) [\(status.os?.rawValue ?? "?")]")
                 }
+                // Keys in full, since they are what `update` takes.
+                let width = items.map(\.key.count).max() ?? 0
                 for i in items {
                     let mark = switch i.state { case .available: "UPDATE"; case .upToDate: "ok"; default: "?" }
                     let cmd = i.command.map { "  $ \($0)" } ?? ""
-                    print("  \(mark.padding(toLength: 7, withPad: " ", startingAt: 0)) \(i.key.padding(toLength: 22, withPad: " ", startingAt: 0)) \(i.installed ?? "?") -> \(i.latest?.version ?? "?")  [\(i.method.label)]\(cmd)")
+                    print("  \(mark.padding(toLength: 7, withPad: " ", startingAt: 0)) \(i.key.padding(toLength: width, withPad: " ", startingAt: 0)) \(i.installed ?? "?") -> \(i.latest?.version ?? "?")  [\(i.method.label)]\(cmd)")
                 }
             }
             print("Log: \(Log.file.path)")

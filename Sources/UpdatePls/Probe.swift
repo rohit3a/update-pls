@@ -61,9 +61,9 @@ enum Probe {
         | grep -v -E '^/usr/share/(doc|applications|icons|pixmaps|man|lintian|mime|metainfo|appdata|swcatalog|bash-completion|zsh|fish|polkit-1|menu)$' \
         | while IFS= read -r x; do if [ -d "$x" ]; then echo "$x"; fi; done | head -1)
       [ -n "$d" ] || return 0
-      for e in /proc/[0-9]*/exe; do
-        x=$(readlink "$e" 2>/dev/null) || continue
-        case "$x" in "$d"/*/*) ;; "$d"/*) p=${e#/proc/}; echo "${p%/exe}" ;; esac
+      # One find reads every process's program; a readlink each would start hundreds of processes.
+      find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null | while IFS=$'\t' read -r h x; do
+        case "$x" in "$d"/*/*) ;; "$d"/*) echo "${h#/proc/}" ;; esac
       done
     }
     up_deb_running() { [ -n "$(up_deb_pids "$1")" ]; }
@@ -162,8 +162,11 @@ enum Probe {
 
     static func unixScript(_ c: Catalog) -> String {
         var s = unixPrelude + debFunctions + unixFunctions
-        for d in c.clis {
-            s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + "\n"
+        // Each tool is read at the same time (a --version or apt-cache can take seconds), into its own file,
+        // and the files are printed in order at the end.
+        s += "UP_O=$(mktemp -d 2>/dev/null) || { UP_O=\"$HOME/.update-pls-probe.$$\"; mkdir -p \"$UP_O\"; }\n"
+        for (n, d) in c.clis.enumerated() {
+            s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + " > \"$UP_O/c\(String(format: "%03d", n))\" &\n"
         }
         s += "if [ \"$(uname -s)\" = Darwin ]; then\n"
         // A swap cut off on this Mac leaves the app missing, so it wouldn't even be listed: put it back first.
@@ -181,10 +184,12 @@ enum Probe {
                 + "      up_to 90 sudo -n apt-get update -qq >/dev/null 2>&1 || true\n    fi\n"
         }
         s += "  fi\n"
-        for d in c.apps { for p in d.linuxDeb ?? [] { s += "  up_deb \(Shell.q(d.id)) \(Shell.q(p))\n" } }
+        for (n, p) in c.apps.flatMap({ d in (d.linuxDeb ?? []).map { (d.id, $0) } }).enumerated() {
+            s += "  up_deb \(Shell.q(p.0)) \(Shell.q(p.1)) > \"$UP_O/d\(String(format: "%03d", n))\" &\n"
+        }
         s += "fi\n"
         // The exit status of the last probe line means nothing; don't report it as a failed scan.
-        s += "true\n"
+        s += "wait\ncat \"$UP_O\"/* 2>/dev/null\nrm -rf \"$UP_O\"\ntrue\n"
         return s
     }
 

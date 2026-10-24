@@ -8,7 +8,7 @@
     { "id": "gemini", "name": "Gemini CLI", "brand": "Google", "binaries": ["gemini"], "npm": ["@google/gemini-cli"], "latest": { "npm": "@google/gemini-cli" } },
     { "id": "copilot", "name": "GitHub Copilot CLI", "brand": "GitHub", "binaries": ["copilot"], "npm": ["@github/copilot"], "latest": { "npm": "@github/copilot" } },
     { "id": "amp", "name": "Amp", "brand": "Amp", "binaries": ["amp"], "npm": ["@ampcode/cli", "@sourcegraph/amp"], "selfUpdate": "update", "latest": { "npm": "@ampcode/cli" } },
-    { "id": "droid", "name": "Factory Droid", "brand": "Factory", "binaries": ["droid"], "npm": ["@factory/cli"], "latest": { "npm": "@factory/cli" } },
+    { "id": "droid", "name": "Factory Droid", "brand": "Factory", "binaries": ["droid"], "npm": ["droid", "@factory/cli"], "selfUpdate": "update", "installVersion": "update --version {version}", "latest": { "npm": "droid" } },
     { "id": "qwen", "name": "Qwen Code", "brand": "Qwen", "binaries": ["qwen"], "npm": ["@qwen-code/qwen-code"], "latest": { "npm": "@qwen-code/qwen-code" } },
     { "id": "crush", "name": "Crush", "brand": "Charm", "binaries": ["crush"], "npm": ["@charmland/crush"], "latest": { "npm": "@charmland/crush" } },
     { "id": "kilocode", "name": "Kilo Code CLI", "brand": "Kilo Code", "binaries": ["kilocode", "kilo"], "npm": ["@kilocode/cli"], "latest": { "npm": "@kilocode/cli" } },

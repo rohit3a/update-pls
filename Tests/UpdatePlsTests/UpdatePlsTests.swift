@@ -54,7 +54,7 @@ final class UpdatePlsTests: XCTestCase {
     func testLinuxDebApps() {
         let out = "OS\tLinux\tx86_64\nSUDO\t1\nDEB\tclaude-desktop\tclaude-desktop\t3.1623.0\t3.6556.1\n" +
             "DEB\tcodex-app\tchatgpt\t26.928.20755\t26.928.20755\t1\n"
-        let items = Engine.buildItems(Probe.parse(out), machine: Machine(id: "rog", name: "rog"), catalog: Catalog.bundled())
+        let items = Engine.buildItems(Probe.parse(out), machine: Machine(id: "linux-box", name: "linux-box"), catalog: Catalog.bundled())
         XCTAssertEqual(items.map(\.name), ["Claude Desktop", "Codex App (ChatGPT)"])
         XCTAssertEqual(items.map(\.running), [false, true])
         XCTAssertEqual(Engine.state(items[0]), .available)
@@ -64,7 +64,7 @@ final class UpdatePlsTests: XCTestCase {
         var epoch = items[0]; epoch.installed = "9.0.0-1"; epoch.latest = LatestInfo(version: "1:2.0.0-1")
         XCTAssertEqual(Engine.state(epoch), .available)
         XCTAssertEqual(items[0].command, "sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y 'claude-desktop'")
-        let asks = Engine.buildItems(Probe.parse(out.replacingOccurrences(of: "SUDO\t1\n", with: "")), machine: Machine(id: "rog", name: "rog"),
+        let asks = Engine.buildItems(Probe.parse(out.replacingOccurrences(of: "SUDO\t1\n", with: "")), machine: Machine(id: "linux-box", name: "linux-box"),
                                      catalog: Catalog.bundled())
         XCTAssertTrue(asks[0].needsSudo)
         XCTAssertFalse(asks[0].canUpdate, "a password is never typed for you: shown as a command to copy")
@@ -152,6 +152,11 @@ final class UpdatePlsTests: XCTestCase {
         let claude = item(.selfUpdate(path: "/u/bin/claude", args: "update"), install: "install {version} --force")
         XCTAssertEqual(claude.rollbackCommand(to: "2.1.300"), "'/u/bin/claude' install 2.1.300 --force")
         XCTAssertFalse(item(.selfUpdate(path: "/u/bin/t3", args: "update")).supportsRollback)
+        // Factory Droid's standalone install updates and switches versions with its own updater.
+        let droid = Probe.parse("CLI\tdroid\tdroid\t/u/.local/bin/droid\t/u/.local/bin/droid\t0.248.0\t\t\t\t0\n")
+        let d = try XCTUnwrap(Engine.buildItems(droid, machine: .local, catalog: Catalog.bundled()).first)
+        XCTAssertEqual(d.command, "'/u/.local/bin/droid' update")
+        XCTAssertEqual(d.rollbackCommand(to: "0.247.0"), "'/u/.local/bin/droid' update --version 0.247.0")
         XCTAssertFalse(item(.cask("cursor")).supportsRollback)
         XCTAssertFalse(item(.npm(bin: "npm", prefix: "/usr", package: "x", tag: "latest", writable: false)).supportsRollback)
         XCTAssertEqual(item(.cask("cursor")).command, "brew upgrade --cask --greedy 'cursor'")
@@ -177,7 +182,7 @@ final class UpdatePlsTests: XCTestCase {
             Engine.macKeepCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app), keep: 3),
             Engine.macRecoverScript(marker: Engine.swapMarkerPath(app)),
             Probe.unixScript(Catalog.bundled()),
-            Engine.commandScript(Item(machine: Machine(id: "rog", name: "rog"), os: .linux, defID: "codex-app", name: "ChatGPT", brand: "OpenAI",
+            Engine.commandScript(Item(machine: Machine(id: "linux-box", name: "linux-box"), os: .linux, defID: "codex-app", name: "ChatGPT", brand: "OpenAI",
                                       isApp: true, path: "chatgpt", method: .deb("chatgpt", passwordless: true)),
                                  "sudo -n apt-get install --only-upgrade -y chatgpt", relaunch: true),
         ] {

@@ -28,7 +28,8 @@ actor LatestResolver {
     func npm(_ pkg: String, installed: String?) async -> LatestInfo? {
         let tags: [String: String]
         if let hit = npmTagCache[pkg] { tags = hit } else {
-            tags = await Self.json("https://registry.npmjs.org/\(pkg)", accept: "application/vnd.npm.install-v1+json")?["dist-tags"] as? [String: String] ?? [:]
+            // Just the tags: a few KB, where the package's full document can be 15 MB.
+            tags = await Self.json("https://registry.npmjs.org/-/package/\(pkg)/dist-tags") as? [String: String] ?? [:]
             npmTagCache[pkg] = tags
         }
         // Follow the installed channel (nightly, preview, ...) when the package publishes one.
@@ -267,7 +268,10 @@ enum GitHubCache {
 
     static func save(_ url: String, _ accept: String?, etag: String, body: Data) {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? (Data((etag + "\n").utf8) + body).write(to: dir.appendingPathComponent(name(url, accept) + ".cache"), options: .atomic)
+        let base = dir.appendingPathComponent(name(url, accept))
+        try? (Data((etag + "\n").utf8) + body).write(to: base.appendingPathExtension("cache"), options: .atomic)
+        // Earlier builds kept the two in separate files.
+        for ext in ["etag", "json"] { try? FileManager.default.removeItem(at: base.appendingPathExtension(ext)) }
     }
 }
 

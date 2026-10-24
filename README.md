@@ -4,6 +4,12 @@ A macOS menu bar app that keeps every AI coding tool up to date, on this Mac and
 
 Claude Desktop and the Codex app don't have an update button. Update pls gives you one for each tool, plus **Update all**.
 
+- Updates each tool the way it was installed: npm, Homebrew, its own updater, pipx, uv, bun, the publisher's download, apt or winget.
+- Checks every desktop app download (hash, signature, Gatekeeper, signing team) before it replaces anything, and quits and reopens open apps for you.
+- Shows live progress for every tool, says exactly why something failed, and only says "Updated" once the new version is really there.
+- Rolls any tool back to an older version.
+- Works on all your SSH machines, with nothing installed on them.
+
 ## What it tracks
 
 **CLIs:** Claude Code, Codex, OpenCode, T3 Code, Cursor Agent, Gemini CLI, GitHub Copilot CLI, Amp, Factory Droid, Qwen Code, Crush, Kilo Code, Cline, Auggie, Goose, Aider, Antigravity CLI
@@ -24,7 +30,7 @@ Each tool is updated the same way it was installed:
 | --- | --- |
 | npm | `npm install -g --prefix <its prefix> <pkg>@<version>` (the right nvm or custom prefix) |
 | Homebrew | `brew upgrade` / `brew upgrade --cask` |
-| Native installer | the tool's own updater (`claude update`, `codex update`, `t3 update`, ...) |
+| Native installer | the tool's own updater (`claude update`, `codex update`, `droid update`, `agy update`, ...) |
 | pipx / uv / bun | `pipx upgrade` / `uv tool upgrade` / `bun add -g` |
 | Mac app download | the publisher's build, checked before it replaces the app (see below) |
 | winget (Windows) | `winget upgrade --id ...` |
@@ -84,8 +90,8 @@ Hover a tool and click **⋯** (or right-click it):
 - **Skip in Update all** leaves that tool alone when you press Update all, and leaves it out of the count on the icon. You can still update it on its own. A ⏸ marks skipped tools; click it to include the tool again.
 - **Hide from list** removes a tool you don't care about from the menu (and from Update all). Settings → **Hidden tools** brings it back.
 - **Roll back to …** puts back the version Update pls replaced:
-  - Mac apps come back from the copy kept when they were updated (one per app, in `~/Library/Application Support/Update pls/Backups`). The copy is checked first: same bundle ID and a valid signature. If the swap fails, the current version stays.
-  - npm, bun, pipx and uv tools, and Claude Code, reinstall that exact version.
+  - Mac apps come back from the copies kept when they were updated (the last 3 versions by default, set in Settings; in `~/Library/Application Support/Update pls/Backups`), or from the publisher's download of that version. A copy is checked first: same bundle ID and a valid signature. If the swap fails, the current version stays.
+  - npm, bun, pipx and uv tools reinstall that exact version, as do Claude Code and Factory Droid through their own updaters.
   - Once rolled back, the version is read again, and the tool is skipped in Update all so it stays put.
 
 ## Updating Update pls

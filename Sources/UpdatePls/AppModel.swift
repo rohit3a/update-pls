@@ -134,7 +134,7 @@ final class AppModel: ObservableObject {
     var activeCount: Int { activity.values.filter(\.isActive).count }
     func isActive(_ item: Item) -> Bool { activity[item.key]?.isActive ?? false }
 
-    /// "Cursor on rog-workstation" for a hidden tool's key, for Settings.
+    /// "Cursor on my-server" for a hidden tool's key, for Settings.
     func label(forKey key: String) -> String {
         guard let i = items.first(where: { $0.key == key }) else { return key }
         return i.machine.isLocal ? i.name : "\(i.name) on \(i.machine.name)"
