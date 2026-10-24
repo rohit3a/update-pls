@@ -36,7 +36,9 @@ Before a Mac app download replaces the installed app, Update pls checks:
 2. `codesign --verify` and `spctl` (Gatekeeper/notarization) pass.
 3. The bundle ID and the **signing team** are the same as the installed app's.
 
-If an app is open, it asks first, then quits it, updates it and reopens it. Many apps also update themselves. Update pls checks the installed version again before it downloads and before it quits the app, and waits for the app's own updater if quitting sets it off. If the app is already on the new version, it isn't replaced or restarted a second time.
+The download is checked while the app keeps running, so it is closed only for the few seconds the swap takes. If an app is open, Update pls asks once (you can turn that off), quits it like ⌘Q, swaps the new version in and reopens it in the background. Apps that weren't open are updated in place and stay closed. If the app doesn't quit, usually because it is asking you something, it is brought to the front and the update stops with that reason instead of hanging.
+
+Many apps also update themselves (Squirrel's ShipIt, Sparkle). Update pls checks the installed version before it downloads, again after the download, and after the app quits, and waits for the app's own updater to finish if quitting sets it off. If the app is already on the new version, it isn't replaced or restarted a second time. The version its own updater replaced is still kept for rollback: the app is cloned just before it quits (instant and free on APFS). If anything fails after the app was quit, the old version stays in place and the app is reopened.
 
 Nothing is installed on your other machines. Checks and updates run over your existing SSH config with `BatchMode`, so password prompts are never answered.
 
@@ -51,6 +53,15 @@ cd update-pls
 open "/Applications/Update pls.app"
 ```
 
+## Progress, errors and logs
+
+Each tool shows what its update is doing right now: waiting in the queue, downloading (with a percentage), checking the signature, quitting, installing, reopening. Updates run one at a time per machine and machines in parallel; pressing Update or Update all again never starts a second install. When an update ends, the row says so: **Updated to 3.27.12**, or the reason it failed in red with **Retry** and a button that opens that update's full output. A notification sums up each batch. After updating, the version is read again, so "Updated" means the new version is really there.
+
+Everything is logged locally:
+
+- `~/Library/Logs/Update pls/update-pls.log`: every check (per machine, with each tool's versions), every failed version lookup (HTTP status, GitHub rate limits), every update and rollback with its steps, result and timing. Also in Console.app under `com.rohit3a.updatepls`. Click **Log** in the menu to open it.
+- `~/Library/Logs/Update pls/runs/`: one file per update with its complete output, written as it runs (the last 60 are kept). **Show last update output** in a tool's **⋯** menu opens it.
+
 ## Command line
 
 The app binary doubles as a CLI:
@@ -60,6 +71,7 @@ The app binary doubles as a CLI:
 "/Applications/Update pls.app/Contents/MacOS/UpdatePls" check my-server  # one host
 "/Applications/Update pls.app/Contents/MacOS/UpdatePls" update all
 "/Applications/Update pls.app/Contents/MacOS/UpdatePls" update local/cursor
+"/Applications/Update pls.app/Contents/MacOS/UpdatePls" update local/cursor --dry-run  # download and check only
 ```
 
 ## Skip and roll back

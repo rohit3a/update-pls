@@ -86,13 +86,80 @@ actor LatestResolver {
                   let text = await Self.get(ymlURL).map({ String(decoding: $0, as: UTF8.self) }) else { continue }
             let (version, files) = Self.parseElectronYml(text)
             let wantArm = arch == "arm64"
+            // A release without a usable zip (still uploading, or broken) is skipped, not the end of the search.
             guard let v = version,
                   let file = files.first(where: { $0.url.hasSuffix(".zip") && $0.url.contains("arm64") == wantArm })
-                    ?? files.first(where: { $0.url.hasSuffix(".zip") }) else { return nil }
+                    ?? files.first(where: { $0.url.hasSuffix(".zip") }) else { continue }
             let url = file.url.hasPrefix("http") ? file.url : "https://github.com/\(feed.repo)/releases/download/\(tag)/\(file.url)"
             return LatestInfo(version: v, url: url, sha512Base64: file.sha512)
         }
         return nil
+    }
+
+    // MARK: Other versions
+
+    /// Published versions this tool can be switched to, newest first: every version on npm or PyPI for CLIs,
+    /// every GitHub release for Mac apps published there. Stays on the installed channel (stable, nightly, ...).
+    func versions(of item: Item, catalog: Catalog) async -> [String] {
+        var all: [String] = []
+        let (npm, pypi) = Engine.registryPackage(item, catalog: catalog)
+        if let npm {
+            let doc = await Self.json("https://registry.npmjs.org/\(npm)", accept: "application/vnd.npm.install-v1+json")
+            all = ((doc?["versions"] as? [String: Any]) ?? [:]).keys.map { $0 }
+        } else if let pypi {
+            let doc = await Self.json("https://pypi.org/pypi/\(pypi)/json")
+            let releases = (doc?["releases"] as? [String: [[String: Any]]]) ?? [:]
+            all = releases.filter { !$0.value.isEmpty && !$0.value.allSatisfy { ($0["yanked"] as? Bool) == true } }.map(\.key)
+        } else if item.isApp, let repo = Self.githubRepo(item, catalog: catalog) {
+            let data = await Self.get("https://api.github.com/repos/\(repo)/releases?per_page=50")
+            let releases = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] } ?? []
+            all = releases.filter { ($0["draft"] as? Bool) != true }.compactMap { ($0["tag_name"] as? String).map(Version.clean) }
+        }
+        let channel = item.installed.flatMap(Version.channel)
+        return all
+            .filter { Version.channel($0) == channel && $0 != item.installed }
+            .sorted { Version.isNewer($0, than: $1) }
+            .prefix(25).map { $0 }
+    }
+
+    /// The download for one exact version of a Mac app published on GitHub, with its checksum when the release lists one.
+    func release(of item: Item, version: String) async -> LatestInfo? {
+        let catalog = Catalog.load()
+        guard let repo = Self.githubRepo(item, catalog: catalog),
+              let data = await Self.get("https://api.github.com/repos/\(repo)/releases?per_page=50"),
+              let releases = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+              let rel = releases.first(where: { ($0["tag_name"] as? String).map(Version.clean) == version }),
+              let tag = rel["tag_name"] as? String else { return nil }
+        let assets = rel["assets"] as? [[String: Any]] ?? []
+        // electron-builder releases list every file with its SHA-512.
+        if let yml = assets.first(where: { ($0["name"] as? String)?.hasSuffix("-mac.yml") == true }),
+           let ymlURL = yml["browser_download_url"] as? String,
+           let text = await Self.get(ymlURL).map({ String(decoding: $0, as: UTF8.self) }) {
+            let (_, files) = Self.parseElectronYml(text)
+            let wantArm = item.arch != "x86_64"
+            if let file = files.first(where: { $0.url.hasSuffix(".zip") && $0.url.contains("arm64") == wantArm })
+                ?? files.first(where: { $0.url.hasSuffix(".zip") }) {
+                let url = file.url.hasPrefix("http") ? file.url : "https://github.com/\(repo)/releases/download/\(tag)/\(file.url)"
+                return LatestInfo(version: version, url: url, sha512Base64: file.sha512)
+            }
+        }
+        // Otherwise the same file as the latest release, with the version swapped in the URL; the download is
+        // still checked by signature, notarization and signing team before it is installed.
+        guard let latest = item.latest, let url = latest.url, url.contains(latest.version) else { return nil }
+        let name = (url.replacingOccurrences(of: latest.version, with: version) as NSString).lastPathComponent
+        guard let asset = assets.first(where: { $0["name"] as? String == name }),
+              let dl = asset["browser_download_url"] as? String else { return nil }
+        return LatestInfo(version: version, url: dl)
+    }
+
+    /// The GitHub repo a Mac app's releases come from: its electron feed, or its download URL.
+    static func githubRepo(_ item: Item, catalog: Catalog) -> String? {
+        let variant = catalog.apps.first { $0.id == item.defID }?.mac?.first { item.path.hasSuffix("/\($0.app).app") }
+        if let feed = variant?.latest.electronGithub { return feed.repo }
+        if let gh = variant?.latest.github { return gh }
+        guard let url = item.latest?.url, let r = url.range(of: "https://github.com/") else { return nil }
+        let parts = url[r.upperBound...].split(separator: "/")
+        return parts.count >= 2 ? "\(parts[0])/\(parts[1])" : nil
     }
 
     static func parseElectronYml(_ text: String) -> (String?, [(url: String, sha512: String)]) {
@@ -140,9 +207,20 @@ actor LatestResolver {
         var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         req.setValue("update-pls", forHTTPHeaderField: "User-Agent")
         if let accept { req.setValue(accept, forHTTPHeaderField: "Accept") }
-        guard let (data, resp) = try? await session.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return data
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let http = resp as? HTTPURLResponse
+            guard http?.statusCode == 200 else {
+                var note = ""
+                if http?.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" { note = " (GitHub rate limit reached; it resets within an hour)" }
+                Log.error("latest: GET \(url) -> HTTP \(http?.statusCode ?? 0)\(note)")
+                return nil
+            }
+            return data
+        } catch {
+            Log.error("latest: GET \(url) -> \(error.localizedDescription)")
+            return nil
+        }
     }
 
     static func json(_ url: String, accept: String? = nil) async -> [String: Any]? {

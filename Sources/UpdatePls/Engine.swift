@@ -30,9 +30,10 @@ enum Method: Hashable {
     }
 }
 
+/// What the last check found. Updates in progress and their results live in `AppModel.activity`,
+/// so a re-check never wipes them.
 enum ItemState: Hashable {
-    case upToDate, available, unknown, updating, updated
-    case failed(String)
+    case upToDate, available, unknown
 }
 
 struct Item: Identifiable, Hashable {
@@ -48,16 +49,21 @@ struct Item: Identifiable, Hashable {
     var method: Method
     var running = false
     var state: ItemState = .unknown
-    var log = ""
     /// From the catalog: how to install one exact version through the tool's own installer.
     var installVersion: String?
+    /// Set when two variants of one app (T3 Code and T3 Code Nightly) are installed side by side.
+    var variant: String?
+    /// Versions of this Mac app that Update pls saved on its machine when it replaced them, newest first.
+    var saved: [String] = []
+    /// The machine's CPU (arm64, x86_64), for picking downloads.
+    var arch = ""
 
     var id: String { "\(machine.id)/\(defID)/\(path)" }
-    /// Stable per machine and tool; used for the Update all skip list and rollback records.
-    var key: String { "\(machine.id)/\(defID)" }
+    /// Stable per machine and tool; used for the skip and hide lists, rollback records and update progress.
+    var key: String { "\(machine.id)/\(defID)" + (variant.map { ":\($0)" } ?? "") }
 
-    /// The command that puts back version `v`, or nil when this install can't be rolled back that way.
-    /// Mac apps downloaded directly roll back from the copy kept at update time instead (see `Engine.rollback`).
+    /// The command that installs exactly version `v`, or nil when this install can't switch versions that way.
+    /// Mac apps downloaded directly use saved copies and release downloads instead (see `Engine.install`).
     func rollbackCommand(to v: String) -> String? {
         guard os != .windows else { return nil }
         switch method {
@@ -79,7 +85,7 @@ struct Item: Identifiable, Hashable {
         return rollbackCommand(to: "0").map { !$0.hasPrefix("sudo ") } ?? false
     }
 
-    /// Shell command shown to the user and run for the update (apps downloaded directly use `macInstallScript`).
+    /// Shell command shown to the user and run for the update (Mac apps use the steps in Update.swift).
     var command: String? {
         switch method {
         case let .npm(bin, prefix, pkg, tag, writable):
@@ -93,11 +99,12 @@ struct Item: Identifiable, Hashable {
         case let .pipx(n): return "pipx upgrade \(Shell.q(n))"
         case let .uv(n): return "uv tool upgrade \(Shell.q(n))"
         case let .selfUpdate(path, args): return os == .windows ? "& \(Shell.psq(path)) \(args)" : "\(Shell.q(path)) \(args)"
-        case let .cask(t): return "brew upgrade --cask \(Shell.q(t))"
+        // Casks of apps that update themselves are skipped by a plain `brew upgrade` unless --greedy.
+        case let .cask(t): return "brew upgrade --cask --greedy \(Shell.q(t))"
         case .macDirect: return nil
         case let .winget(id):
             return "winget upgrade --id \(Shell.psq(id)) --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
-        case let .deb(p): return "sudo apt-get update && sudo apt-get install --only-upgrade -y \(p)"
+        case let .deb(p): return "sudo apt-get update && sudo apt-get install --only-upgrade -y \(Shell.q(p))"
         case .none: return nil
         }
     }
@@ -105,14 +112,14 @@ struct Item: Identifiable, Hashable {
     /// Updates that need a password are shown as a command to copy instead of being run.
     var needsSudo: Bool { command?.hasPrefix("sudo ") == true }
 
+    /// Update pls can run this update itself.
     var canUpdate: Bool {
-        guard state == .available || state == .unknown || isFailed else { return false }
         if needsSudo { return false }
         if case .macDirect = method { return latest?.url != nil }
         return command != nil
     }
 
-    var isFailed: Bool { if case .failed = state { return true }; return false }
+    var summary: String { "\(installed ?? "?") -> \(latest?.version ?? "?") [\(method.label)]" }
 }
 
 struct MachineStatus: Identifiable, Hashable {
@@ -124,27 +131,45 @@ struct MachineStatus: Identifiable, Hashable {
 }
 
 enum Engine {
-    static func check(_ m: Machine, catalog: Catalog, resolver: LatestResolver) async -> (MachineStatus, [Item]) {
+    /// Finds what is installed on a machine and the newest version of each.
+    /// `known` reuses latest versions already looked up (by item key), so a re-check after an update stays quick.
+    static func check(_ m: Machine, catalog: Catalog, resolver: LatestResolver, known: [String: LatestInfo] = [:]) async -> (MachineStatus, [Item]) {
+        let start = Date()
         var status = MachineStatus(machine: m)
         let os: OSKind
         switch await Runner.detectOS(m) {
-        case let .offline(msg): status.state = .offline(msg); return (status, [])
+        case let .offline(msg):
+            status.state = .offline(msg)
+            Log.error("check \(m.id): offline: \(msg)")
+            return (status, [])
         case let .os(o): os = o
         }
         status.os = os
         let script = os == .windows ? Probe.windowsScript(catalog) : Probe.unixScript(catalog)
         let out = await Runner.run(m, os: os, script: script, timeout: 240)
-        if out.status == 255 { status.state = .offline(out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)); return (status, []) }
+        if out.status == 255 || (out.timedOut && out.stdout.isEmpty) {
+            let msg = out.timedOut ? "Timed out" : out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            status.state = .offline(msg)
+            Log.error("check \(m.id): scan failed: \(msg)")
+            return (status, [])
+        }
+        if !out.ok {
+            Log.error("check \(m.id): scan exited \(out.status)\(out.timedOut ? " (timed out, results may be partial)" : "")\n"
+                      + out.stderr.split(separator: "\n").suffix(15).joined(separator: "\n"))
+        }
         status.state = .online
         let probe = Probe.parse(out.stdout)
         var items = buildItems(probe, machine: m, catalog: catalog)
         await withTaskGroup(of: (Int, LatestInfo?).self) { group in
             for (i, item) in items.enumerated() where item.latest == nil {
+                if let k = known[item.key] { items[i].latest = k; continue }
                 group.addTask { (i, await latest(for: item, probe: probe, catalog: catalog, resolver: resolver)) }
             }
             for await (i, info) in group { items[i].latest = info }
         }
         for i in items.indices { items[i].state = state(items[i]) }
+        Log.info("check \(m.id) [\(os.rawValue)]: \(items.count) tools in \(String(format: "%.1f", Date().timeIntervalSince(start)))s\n"
+                 + items.map { "\($0.key) \($0.summary) \($0.state)\($0.running ? " open" : "")" }.joined(separator: "\n"))
         return (status, items)
     }
 
@@ -162,14 +187,18 @@ enum Engine {
             items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: false, path: r.path,
                               installed: installed, method: cliMethod(r, def: def, os: p.os, installed: installed), installVersion: def.installVersion))
         }
+        let appCounts = Dictionary(grouping: p.apps, by: \.id).mapValues(\.count)
         for r in p.apps {
             guard let def = catalog.apps.first(where: { $0.id == r.id }),
                   let variant = def.mac?.first(where: { $0.app == r.appName }) else { continue }
             let method: Method = if let t = variant.latest.cask, p.hasBrew, p.casks.contains(t) { .cask(t) }
                                  else { .macDirect(appPath: r.path, bundleID: r.bundleID) }
             let name = def.mac!.count == 1 ? def.name : r.appName.hasPrefix(def.name) ? r.appName : "\(def.name) (\(r.appName))"
+            let saved = Set(p.saved.filter { $0.id == r.id && $0.appName == r.appName }.map(\.version))
             items.append(Item(machine: machine, os: p.os, defID: def.id, name: name, brand: def.brand ?? def.name, isApp: true, path: r.path,
-                              installed: r.version, method: method, running: r.running))
+                              installed: r.version, method: method, running: r.running,
+                              variant: (appCounts[r.id] ?? 0) > 1 ? r.appName : nil,
+                              saved: saved.sorted { Version.isNewer($0, than: $1) }))
         }
         for r in p.debs {
             guard let def = catalog.apps.first(where: { $0.id == r.id }) else { continue }
@@ -191,6 +220,7 @@ enum Engine {
                 break
             }
         }
+        for i in items.indices { items[i].arch = p.arch }
         return items
     }
 
@@ -214,6 +244,17 @@ enum Engine {
         return .none
     }
 
+    /// The npm or PyPI package whose published versions this tool can be switched to, if any.
+    static func registryPackage(_ item: Item, catalog: Catalog) -> (npm: String?, pypi: String?) {
+        let def = catalog.clis.first { $0.id == item.defID }
+        switch item.method {
+        case let .npm(_, _, pkg, _, _), let .bun(pkg): return (pkg, nil)
+        case let .pipx(n), let .uv(n): return (nil, def?.pypi ?? n)
+        case .selfUpdate where item.installVersion != nil: return (def?.latest?.npm ?? def?.npm?.first, nil)
+        default: return (nil, nil)
+        }
+    }
+
     static func latest(for item: Item, probe: ProbeResult, catalog: Catalog, resolver: LatestResolver) async -> LatestInfo? {
         let arch = probe.arch
         if item.isApp {
@@ -232,155 +273,14 @@ enum Engine {
         }
     }
 
-    /// Runs the update for one item. Desktop apps are quit first and reopened if `relaunch`.
-    static func update(_ item: Item, relaunch: Bool) async -> ShellResult {
-        var script: String
-        var item = item
-        if case let .npm(bin, prefix, pkg, _, w) = item.method {
-            // Install the exact version we found, so nightly users stay on nightly.
-            item.method = .npm(bin: bin, prefix: prefix, package: pkg, tag: item.latest?.version ?? "latest", writable: w)
-        }
-        if item.os == .windows {
-            guard let cmd = item.command else { return ShellResult(status: 1, stdout: "", stderr: "No update method") }
-            script = Probe.windowsPrelude + cmd + "\nexit $LASTEXITCODE\n"
-        } else {
-            script = Probe.unixPrelude + "set -e\n"
-            switch item.method {
-            case let .macDirect(appPath, bundleID):
-                guard let info = item.latest, let url = info.url else {
-                    return ShellResult(status: 1, stdout: "", stderr: "No download available")
-                }
-                script += macInstallScript(app: appPath, bundleID: bundleID, url: url, info: info, backup: backupPath(item), relaunch: relaunch)
-            case let .cask(token):
-                if item.running { script += quitScript(bundleIDOf: item.path) }
-                script += "brew upgrade --cask \(Shell.q(token))\n"
-                if item.running && relaunch { script += "open \(Shell.q(item.path))\n" }
-            default:
-                guard let cmd = item.command else { return ShellResult(status: 1, stdout: "", stderr: "No update method") }
-                script += cmd + "\n"
-            }
-        }
-        return await Runner.run(item.machine, os: item.os, script: script, timeout: 900)
+    /// Where the versions of a Mac app that Update pls replaced are kept, relative to $HOME on its machine:
+    /// one folder per version, each holding the app.
+    static func savedPath(_ item: Item) -> String {
+        "Library/Application Support/Update pls/Backups/\(item.defID)"
     }
 
-    /// Puts back the version Update pls replaced. Mac apps come back from the copy kept at update time,
-    /// after checking it is the same app with a valid signature; other tools reinstall that exact version.
-    static func rollback(_ item: Item, to version: String, relaunch: Bool) async -> ShellResult {
-        var script = Probe.unixPrelude + "set -e\n"
-        if case let .macDirect(appPath, bundleID) = item.method {
-            script += macRollbackScript(app: appPath, bundleID: bundleID, backup: backupPath(item), relaunch: relaunch)
-        } else if let cmd = item.rollbackCommand(to: version) {
-            script += cmd + "\n"
-        } else {
-            return ShellResult(status: 1, stdout: "", stderr: "This install can't be rolled back")
-        }
-        return await Runner.run(item.machine, os: item.os, script: script, timeout: 900)
-    }
-
-    /// Where a Mac app's previous version is kept, relative to $HOME on its machine. One per app.
-    static func backupPath(_ item: Item) -> String {
-        "Library/Application Support/Update pls/Backups/\(item.defID)/\((item.path as NSString).lastPathComponent)"
-    }
-
-    /// Quits the app at $APP (bundle id $BID) if it is running and sets WAS_RUNNING.
-    /// Quitting can set off the app's own updater (Squirrel's ShipIt) when it has an update waiting,
-    /// so this also waits for that to finish. ShipIt may reopen the app; callers decide what to do then.
-    static let quitIfRunning = """
-    app_running() { ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null; }
-    quit_app() {
-      osascript -e "tell application id \\"$BID\\" to quit" >/dev/null 2>&1 || true
-      for i in $(seq 1 60); do app_running || break; sleep 0.5; done
-      if app_running; then echo 'The app did not quit. Close it and try again.' >&2; exit 1; fi
-    }
-    WAS_RUNNING=0
-    if app_running; then
-      WAS_RUNNING=1
-      quit_app
-      sleep 1
-      for i in $(seq 1 240); do ps -axo command= | grep -F ShipIt | grep -F -e "$BID" -e "$APP/" | grep -v grep >/dev/null || break; sleep 0.5; done
-    fi
-
-    """
-
-    static func macRollbackScript(app: String, bundleID: String, backup: String, relaunch: Bool) -> String {
-        """
-        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); BK="$HOME/"\(Shell.q(backup))
-        [ -d "$BK" ] || { echo 'No saved previous version on this machine' >&2; exit 1; }
-        [ "$(defaults read "$BK/Contents/Info" CFBundleIdentifier)" = "$BID" ] || { echo 'Saved version has a different bundle id' >&2; exit 1; }
-        codesign --verify --deep --strict "$BK"
-        \(quitIfRunning)
-        app_running && quit_app
-        T=$(mktemp -d /tmp/update-pls.XXXXXX)
-        mv "$APP" "$T/current.app"
-        if ! mv "$BK" "$APP"; then rm -rf "$APP"; mv "$T/current.app" "$APP"; echo 'Rollback failed, current version kept' >&2; exit 1; fi
-        rm -rf "$T"
-        echo "Rolled back to $(defaults read "$APP/Contents/Info" CFBundleShortVersionString)"
-        \(relaunch ? "[ $WAS_RUNNING = 1 ] && open \"$APP\"" : ":")
-        exit 0
-
-        """
-    }
-
-    static func quitScript(bundleIDOf appPath: String) -> String {
-        """
-        up_bid=$(defaults read \(Shell.q(appPath + "/Contents/Info")) CFBundleIdentifier)
-        osascript -e "tell application id \\"$up_bid\\" to quit" >/dev/null 2>&1 || true
-        for i in $(seq 1 60); do ps -axo command= | grep -F \(Shell.q(appPath + "/Contents/MacOS/")) | grep -v grep >/dev/null || break; sleep 0.5; done
-        if ps -axo command= | grep -F \(Shell.q(appPath + "/Contents/MacOS/")) | grep -v grep >/dev/null; then echo "The app did not quit. Close it and try again." >&2; exit 1; fi
-
-        """
-    }
-
-    /// Downloads the publisher's build, checks its hash, signature, notarization and team,
-    /// then swaps it in place of the installed app.
-    static func macInstallScript(app: String, bundleID: String, url: String, info: LatestInfo, backup: String, relaunch: Bool) -> String {
-        var verify = ""
-        if let h = info.sha256 { verify = "[ \"$(shasum -a 256 \"$T/dl\" | cut -d' ' -f1)\" = \(Shell.q(h)) ] || { echo 'Checksum mismatch' >&2; exit 1; }" }
-        else if let h = info.sha512Base64 { verify = "[ \"$(openssl dgst -sha512 -binary \"$T/dl\" | base64)\" = \(Shell.q(h)) ] || { echo 'Checksum mismatch' >&2; exit 1; }" }
-        return """
-        APP=\(Shell.q(app)); BID=\(Shell.q(bundleID)); URL=\(Shell.q(url)); BK="$HOME/"\(Shell.q(backup)); VER=\(Shell.q(info.version))
-        current() { defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true; }
-        # Many apps update themselves too; never redo (and restart for) an update that already happened.
-        if [ "$(current)" = "$VER" ]; then echo "Already on $VER"; exit 0; fi
-        T=$(mktemp -d /tmp/update-pls.XXXXXX)
-        cleanup() { [ -d "$T/mnt" ] && hdiutil detach "$T/mnt" -quiet >/dev/null 2>&1; rm -rf "$T"; }
-        trap cleanup EXIT
-        echo "Downloading $URL"
-        curl -fsSL --retry 2 -o "$T/dl" "$URL"
-        \(verify)
-        mkdir -p "$T/x"
-        if [ "$(head -c 2 "$T/dl")" = "PK" ]; then
-          ditto -x -k "$T/dl" "$T/x"
-        else
-          mkdir -p "$T/mnt"
-          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$T/mnt" "$T/dl" -quiet
-          for a in "$T/mnt"/*.app; do ditto "$a" "$T/x/$(basename "$a")"; done
-          hdiutil detach "$T/mnt" -quiet; rmdir "$T/mnt"
-        fi
-        NEW=$(find "$T/x" -maxdepth 2 -name '*.app' -type d | head -1)
-        [ -n "$NEW" ] || { echo 'No app found in download' >&2; exit 1; }
-        [ "$(defaults read "$NEW/Contents/Info" CFBundleIdentifier)" = "$BID" ] || { echo 'Downloaded app has a different bundle id' >&2; exit 1; }
-        codesign --verify --deep --strict "$NEW"
-        spctl --assess --type execute "$NEW"
-        team() { codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p'; }
-        OLD_TEAM=$(team "$APP"); NEW_TEAM=$(team "$NEW")
-        [ -n "$NEW_TEAM" ] && [ "$NEW_TEAM" != "not set" ] && [ "$NEW_TEAM" = "$OLD_TEAM" ] || { echo "Signing team changed ($OLD_TEAM -> $NEW_TEAM)" >&2; exit 1; }
-        if [ "$(current)" = "$VER" ]; then echo "Already on $VER"; exit 0; fi
-        \(quitIfRunning)
-        if [ "$(current)" = "$VER" ]; then
-          echo "Already on $VER (the app installed its own update as it quit)"
-          \(relaunch ? "[ $WAS_RUNNING = 1 ] && ! app_running && open \"$APP\"" : ":")
-          exit 0
-        fi
-        app_running && quit_app
-        # Keep the replaced version for rollback (one per app).
-        rm -rf "$BK"; mkdir -p "$(dirname "$BK")"
-        mv "$APP" "$BK"
-        if ! ditto "$NEW" "$APP"; then rm -rf "$APP"; mv "$BK" "$APP"; echo 'Install failed, previous version restored' >&2; exit 1; fi
-        echo "Installed $(defaults read "$APP/Contents/Info" CFBundleShortVersionString)"
-        \(relaunch ? "[ $WAS_RUNNING = 1 ] && open \"$APP\"" : ":")
-        exit 0
-
-        """
+    /// Where a Mac app's download is unpacked and checked before it is installed, relative to $HOME.
+    static func stagingPath(_ item: Item) -> String {
+        "Library/Caches/Update pls/Staging/\(item.defID)-\((item.path as NSString).lastPathComponent)"
     }
 }

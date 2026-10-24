@@ -28,10 +28,14 @@ enum SelfUpdate {
             NSWorkspace.shared.open(URL(string: "https://github.com/\(repo)")!)
             return nil
         }
+        Log.info("self-update: pulling and rebuilding \(src)")
         let r = await Shell.run("/bin/bash", ["-c", "cd \(Shell.q(src)) && git pull --ff-only && ./scripts/build-app.sh"], timeout: 900)
         guard r.ok else {
-            return r.timedOut ? "Timed out" : r.combined.split(separator: "\n").last.map(String.init) ?? "Update failed"
+            let why = Engine.failure(r)
+            Log.error("self-update failed: \(why)\n" + r.combined.split(separator: "\n").suffix(30).joined(separator: "\n"))
+            return why
         }
+        Log.info("self-update: built, swapping in and reopening")
         let built = src + "/build/Update pls.app", dest = Bundle.main.bundlePath
         let swap = """
         while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done

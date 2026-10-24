@@ -12,6 +12,9 @@ struct AppRecord {
 
 struct DebRecord { var id, package, installed, candidate: String }
 
+/// A version of a Mac app that Update pls saved when it replaced it.
+struct SavedRecord { var id, appName, version: String }
+
 struct WingetRow { var name, id, version, available: String }
 
 struct ProbeResult {
@@ -22,6 +25,7 @@ struct ProbeResult {
     var casks: Set<String> = []
     var hasBrew = false
     var debs: [DebRecord] = []
+    var saved: [SavedRecord] = []
     var winget: [WingetRow] = []
 }
 
@@ -80,6 +84,9 @@ enum Probe {
         run=0
         ps -axo command= | grep -F "$a/Contents/MacOS/" | grep -v grep >/dev/null && run=1
         printf 'APP\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$a" "$v" "$bid" "$run"
+        for s in "$HOME/Library/Application Support/Update pls/Backups/$1"/*/"$2.app" "$HOME/Library/Application Support/Update pls/Backups/$1/$2.app"; do
+          [ -d "$s" ] && printf 'SAVED\t%s\t%s\t%s\n' "$1" "$2" "$(defaults read "$s/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
+        done
         return
       done
     }
@@ -107,6 +114,8 @@ enum Probe {
         s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  :\n"
         for d in c.apps { for p in d.linuxDeb ?? [] { s += "  up_deb \(Shell.q(d.id)) \(Shell.q(p))\n" } }
         s += "fi\n"
+        // The exit status of the last probe line means nothing; don't report it as a failed scan.
+        s += "true\n"
         return s
     }
 
@@ -166,6 +175,8 @@ enum Probe {
                                         package: f[6], packageVersion: f[7], npmBin: f[8], writable: f[9] == "1"))
             case "APP" where f.count >= 7:
                 r.apps.append(AppRecord(id: f[1], appName: f[2], path: f[3], version: f[4], bundleID: f[5], running: f[6] == "1"))
+            case "SAVED" where f.count >= 4 && !f[3].isEmpty:
+                r.saved.append(SavedRecord(id: f[1], appName: f[2], version: f[3]))
             case "DEB" where f.count >= 5:
                 r.debs.append(DebRecord(id: f[1], package: f[2], installed: f[3], candidate: f[4]))
             case "WL" where f.count >= 2:

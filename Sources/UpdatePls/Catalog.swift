@@ -67,7 +67,11 @@ struct Catalog: Codable {
         var c = bundled()
         guard let data = try? Data(contentsOf: userFile) else { return c }
         struct Partial: Codable { var clis: [CLIDef]?; var apps: [AppDef]? }
-        guard let user = try? JSONDecoder().decode(Partial.self, from: data) else { return c }
+        let user: Partial
+        do { user = try JSONDecoder().decode(Partial.self, from: data) } catch {
+            Log.error("\(userFile.path) is not valid, so your own tools are left out: \(error)")
+            return c
+        }
         for d in user.clis ?? [] { c.clis.removeAll { $0.id == d.id }; c.clis.append(d) }
         for d in user.apps ?? [] { c.apps.removeAll { $0.id == d.id }; c.apps.append(d) }
         return c
