@@ -4,7 +4,7 @@ import SwiftUI
 enum Main {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
-        if args.first == "check" || args.first == "update" {
+        if ["check", "update", "versions", "install"].contains(args.first) {
             exit(CLI.run(args))
         }
         // With no saved position, macOS puts a new menu bar icon at the far left, which on a full menu bar
@@ -21,7 +21,7 @@ struct UpdatePlsApp: App {
         MenuBarExtra {
             MenuView().environmentObject(model)
         } label: {
-            Image(nsImage: MenuIcon.image(count: model.updateCount))
+            Image(nsImage: MenuIcon.image(count: model.updateCount, busy: model.isBusy))
         }
         .menuBarExtraStyle(.window)
     }
@@ -46,13 +46,15 @@ enum SettingsWindow {
     }
 }
 
-/// Menu bar icon: the down-arrow circle, with the update count punched into a badge when there are updates.
-/// A template image, so it follows the menu bar's light or dark look.
+/// Menu bar icon: the down-arrow circle, with the update count punched into a badge when there are updates,
+/// and a dotted circle while updates are running. A template image, so it follows the menu bar's light or dark look.
 enum MenuIcon {
-    static func image(count: Int) -> NSImage {
-        let symbol = NSImage(systemSymbolName: count > 0 ? "arrow.down.circle.fill" : "arrow.down.circle", accessibilityDescription: "Update pls")!
+    static func image(count: Int, busy: Bool = false) -> NSImage {
+        let name = busy ? "arrow.down.circle.dotted" : count > 0 ? "arrow.down.circle.fill" : "arrow.down.circle"
+        let symbol = (NSImage(systemSymbolName: name, accessibilityDescription: busy ? "Update pls, updating" : "Update pls")
+            ?? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "Update pls")!)
             .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))!
-        guard count > 0 else { symbol.isTemplate = true; return symbol }
+        guard count > 0, !busy else { symbol.isTemplate = true; return symbol }
         let label = count > 99 ? "99+" : "\(count)"
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .bold)
         let text = NSAttributedString(string: label, attributes: [.font: font, .foregroundColor: NSColor.black])
@@ -79,7 +81,8 @@ enum MenuIcon {
     }
 }
 
-/// `UpdatePls check [host…]` and `UpdatePls update <host>/<tool-id>|all` for terminals and scripts.
+/// The command line, for terminals and scripts:
+/// `check [host…]`, `update <host>/<tool>|all [--dry-run]`, `versions <host>/<tool>`, `install <host>/<tool> <version> [--download]`.
 enum CLI {
     static func run(_ args: [String]) -> Int32 {
         var code: Int32 = 0
@@ -100,15 +103,41 @@ enum CLI {
 
     static func checkAll(_ machines: [Machine]) async -> [(MachineStatus, [Item])] {
         let catalog = Catalog.load(), resolver = LatestResolver()
-        return await withTaskGroup(of: (MachineStatus, [Item]).self) { g in
+        let out = await withTaskGroup(of: (MachineStatus, [Item]).self) { g in
             for m in machines { g.addTask { await Engine.check(m, catalog: catalog, resolver: resolver) } }
             var out: [(MachineStatus, [Item])] = []
             for await r in g { out.append(r) }
             return out.sorted { $0.0.machine.id < $1.0.machine.id }
         }
+        History.migrateVariantKeys(out.flatMap(\.1))
+        return out
+    }
+
+    /// Reads the machines of finished jobs again and confirms each by its installed version, as the menu does;
+    /// only then is it recorded. Returns false if any didn't take.
+    static func confirm(_ done: [(item: Item, version: String?, outcome: UpdateOutcome)]) async -> Bool {
+        let finished = done.filter(\.outcome.ok)
+        guard !finished.isEmpty else { return true }
+        print("== Checking the new versions")
+        let again = await checkAll(Array(Set(finished.map(\.item.machine))))
+        var allOK = true
+        for (i, version, o) in finished {
+            let scan = again.first { $0.0.machine == i.machine }
+            let offline = if case .offline? = scan?.0.state { true } else { false }
+            let (ok, message) = Engine.confirm(i, switchedTo: version, o, fresh: scan?.1.first { $0.key == i.key }, offline: offline)
+            print("   \(ok ? "OK" : "FAILED") \(i.key): \(message)")
+            if !ok { allOK = false; Log.error("verify \(i.key): \(message)"); continue }
+            switch History.record(i, switchedTo: version, o) {
+            case .added: print("   (skipped in Update all so it stays on \(version ?? ""))")
+            case .lifted: print("   (back in Update all)")
+            case nil: break
+            }
+        }
+        return allOK
     }
 
     static func main(_ args: [String]) async -> Int32 {
+        Log.info("command line: \(args.joined(separator: " "))")
         if args[0] == "check" {
             print("Update pls \(SelfUpdate.current) (latest \(await SelfUpdate.latest() ?? "?"))")
             for (status, items) in await checkAll(machines(Array(args.dropFirst()))) {
@@ -119,13 +148,21 @@ enum CLI {
                 for i in items {
                     let mark = switch i.state { case .available: "UPDATE"; case .upToDate: "ok"; default: "?" }
                     let cmd = i.command.map { "  $ \($0)" } ?? ""
-                    print("  \(mark.padding(toLength: 7, withPad: " ", startingAt: 0)) \(i.defID.padding(toLength: 16, withPad: " ", startingAt: 0)) \(i.installed ?? "?") -> \(i.latest?.version ?? "?")  [\(i.method.label)]\(cmd)")
+                    print("  \(mark.padding(toLength: 7, withPad: " ", startingAt: 0)) \(i.key.padding(toLength: 22, withPad: " ", startingAt: 0)) \(i.installed ?? "?") -> \(i.latest?.version ?? "?")  [\(i.method.label)]\(cmd)")
                 }
             }
+            print("Log: \(Log.file.path)")
             return 0
         }
-        guard args.count >= 2 else { print("usage: UpdatePls update <host>/<tool-id> | all"); return 2 }
-        let target = args[1]
+        let awake = KeepAwake.begin("Updating tools")
+        defer { KeepAwake.end(awake) }
+        if args[0] == "versions" || args[0] == "install" { return await versions(args) }
+        let dryRun = args.contains("--dry-run")
+        let rest = args.dropFirst().filter { $0 != "--dry-run" }
+        guard let target = rest.first, target == "all" || target.split(separator: "/").count >= 2 else {
+            print("usage: UpdatePls update <host>/<tool-id> | all [--dry-run]")
+            return 2
+        }
         let results = await checkAll(machines(target == "all" ? [] : [String(target.split(separator: "/")[0])]))
         let skipped = Set((UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
             + (UserDefaults.standard.stringArray(forKey: "hiddenTools") ?? []))
@@ -134,12 +171,54 @@ enum CLI {
         }
         if items.isEmpty { print("Nothing to update"); return 0 }
         var code: Int32 = 0
+        var done: [(item: Item, version: String?, outcome: UpdateOutcome)] = []
+        // One machine at a time here keeps the terminal output readable.
         for i in items {
             print("== \(i.machine.id)/\(i.defID): \(i.installed ?? "?") -> \(i.latest?.version ?? "latest")")
-            let r = await Engine.update(i, relaunch: true)
-            print(r.combined)
-            if !r.ok { code = 1; print("FAILED") }
+            let file = Log.newRun(i.key)
+            Log.appendRun(file, "\(Log.stamp()) \(i.name) on \(i.machine.name): update \(i.summary)\(dryRun ? " (dry run)" : "")\n")
+            let r = Reporter(runFile: file) { text, fraction in
+                print("   \(text)\(fraction.map { " \(Int($0 * 100))%" } ?? "")")
+            }
+            let o = await Engine.update(i, relaunch: true, reporter: r, dryRun: dryRun)
+            Log.appendRun(file, "\n\(Log.stamp()) \(o.ok ? "Done" : "FAILED"): \(o.message)\n")
+            print(o.ok ? "   finished: \(o.message)" : "   FAILED: \(o.message)")
+            print("   output: \(file.path)")
+            if !o.ok { code = 1 }
+            if !dryRun { done.append((i, nil, o)) }
         }
+        if await !confirm(done) { code = 1 }
         return code
+    }
+
+    /// `versions <host>/<tool>` lists what a tool can switch to; `install <host>/<tool> <version>` switches it,
+    /// from a saved copy when there is one (or `--download` to fetch the published build).
+    static func versions(_ args: [String]) async -> Int32 {
+        let rest = args.dropFirst().filter { !$0.hasPrefix("--") }
+        guard let target = rest.first, target.split(separator: "/").count >= 2, args[0] == "versions" || rest.count >= 2 else {
+            print("usage: UpdatePls versions <host>/<tool>\n       UpdatePls install <host>/<tool> <version> [--download]")
+            return 2
+        }
+        let results = await checkAll(machines([String(target.split(separator: "/")[0])]))
+        guard let item = results.flatMap(\.1).first(where: { $0.key == target }) else { print("No \(target) found"); return 1 }
+        guard item.supportsRollback else { print("\(item.name) can't switch versions (\(item.method.label))"); return 1 }
+        if args[0] == "versions" {
+            print("\(item.name) on \(item.machine.name): installed \(item.installed ?? "?"), latest \(item.latest?.version ?? "?")")
+            if !item.saved.isEmpty { print("saved:     " + item.saved.joined(separator: "  ")) }
+            print("published: " + (await LatestResolver().versions(of: item, catalog: Catalog.load())).joined(separator: "  "))
+            return 0
+        }
+        let version = rest[rest.index(after: rest.startIndex)]
+        let source: Engine.VersionSource = item.saved.contains(version) && !args.contains("--download") ? .saved : .published
+        print("== \(target): \(item.installed ?? "?") -> \(version) (\(source == .saved ? "saved copy" : "download"))")
+        let file = Log.newRun(item.key)
+        Log.appendRun(file, "\(Log.stamp()) \(item.name) on \(item.machine.name): switch to \(version) (\(source == .saved ? "saved copy" : "published"))\n")
+        let r = Reporter(runFile: file) { text, fraction in print("   \(text)\(fraction.map { " \(Int($0 * 100))%" } ?? "")") }
+        let o = await Engine.install(item, version: version, from: source, relaunch: true, reporter: r)
+        Log.appendRun(file, "\n\(Log.stamp()) \(o.ok ? "Done" : "FAILED"): \(o.message)\n")
+        print(o.ok ? "   finished: \(o.message)" : "   FAILED: \(o.message)")
+        print("   output: \(file.path)")
+        guard o.ok else { return 1 }
+        return await confirm([(item, version, o)]) ? 0 : 1
     }
 }
