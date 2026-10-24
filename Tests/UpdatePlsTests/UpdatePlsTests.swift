@@ -46,6 +46,22 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(items[2].arch, "arm64")
     }
 
+    /// apt apps are found, and updated by Update pls only where sudo needs no password.
+    func testLinuxDebApps() {
+        let out = "OS\tLinux\tx86_64\nSUDO\t1\nDEB\tclaude-desktop\tclaude-desktop\t3.1623.0\t3.6556.1\n" +
+            "DEB\tcodex-app\tchatgpt\t26.928.20755\t26.928.20755\t1\n"
+        let items = Engine.buildItems(Probe.parse(out), machine: Machine(id: "rog", name: "rog"), catalog: Catalog.bundled())
+        XCTAssertEqual(items.map(\.name), ["Claude Desktop", "Codex App (ChatGPT)"])
+        XCTAssertEqual(items.map(\.running), [false, true])
+        XCTAssertEqual(Engine.state(items[0]), .available)
+        XCTAssertTrue(items[0].canUpdate)
+        XCTAssertEqual(items[0].command, "sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y 'claude-desktop'")
+        let asks = Engine.buildItems(Probe.parse(out.replacingOccurrences(of: "SUDO\t1\n", with: "")), machine: Machine(id: "rog", name: "rog"),
+                                     catalog: Catalog.bundled())
+        XCTAssertTrue(asks[0].needsSudo)
+        XCTAssertFalse(asks[0].canUpdate, "a password is never typed for you: shown as a command to copy")
+    }
+
     func testWingetParse() {
         let lines = [
             "\r   - \r   \\ \r",
@@ -114,6 +130,13 @@ final class UpdatePlsTests: XCTestCase {
             Engine.macSwapScript(app: app.path, bundleID: "com.t", name: "T", staged: nil, version: "1", stage: Engine.stagingPath(app),
                                  saved: Engine.savedPath(app), keep: 3),
             Engine.macOpenScript(app: app.path, bundleID: "com.t"),
+            Engine.macStateScript(app: app.path, bundleID: "com.t", marker: Engine.swapMarkerPath(app)),
+            Engine.macStageScript(app: app.path, bundleID: "com.t", name: "T", url: "x", info: info, stage: Engine.stagingPath(app), local: "/tmp/T.app"),
+            Engine.macStageScript(app: app.path, bundleID: "com.t", name: "T", url: "x", info: info, stage: Engine.stagingPath(app), local: "/tmp/T.zip"),
+            Engine.macCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app)),
+            Engine.macKeepCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app), keep: 3),
+            Engine.macRecoverScript(marker: Engine.swapMarkerPath(app)),
+            Probe.debFunctions + "up_deb_running chatgpt || true\n",
         ] {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -271,6 +294,84 @@ final class UpdatePlsTests: XCTestCase {
                                        trust: false, run: sandbox.runner)
         XCTAssertFalse(o.ok)
         XCTAssertEqual(o.message.components(separatedBy: ":").first, "Download failed")
+    }
+
+    func testItemLockAllowsOneUpdateAtATime() throws {
+        let saved = ItemLock.dir
+        ItemLock.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-locks-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: ItemLock.dir); ItemLock.dir = saved }
+        let a = try XCTUnwrap(ItemLock.take("local/cursor"))
+        XCTAssertNil(ItemLock.take("local/cursor"), "a second update of the same tool must wait")
+        XCTAssertNotNil(ItemLock.take("local/antigravity"), "other tools aren't blocked")
+        a.release()
+        XCTAssertNotNil(ItemLock.take("local/cursor"))
+    }
+
+    /// A swap cut off between its two moves leaves the app missing; it is put back before anything else.
+    func testInterruptedSwapIsRecovered() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        var item = sandbox.item(installed: "1.0")
+        let kept = sandbox.home.appendingPathComponent(Engine.savedPath(item)).appendingPathComponent("1.0/T.app")
+        func interrupt() throws {
+            try sandbox.makeApp(at: kept, version: "1.0")
+            try? FileManager.default.removeItem(at: sandbox.app)
+            let marker = sandbox.home.appendingPathComponent(Engine.swapMarkerPath(item))
+            try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "\(sandbox.app.path)\n\(kept.path)\n\(item.key)\n".write(to: marker, atomically: true, encoding: .utf8)
+        }
+
+        // At launch, unless another Update pls holds that tool's lock (its swap may be in progress).
+        let savedLocks = ItemLock.dir
+        ItemLock.dir = sandbox.home.appendingPathComponent("Locks")
+        defer { ItemLock.dir = savedLocks }
+        try interrupt()
+        let held = try XCTUnwrap(ItemLock.take(item.key))
+        var restored = await Engine.recoverInterruptedSwaps(home: sandbox.home, run: sandbox.runner)
+        XCTAssertEqual(restored, [])
+        XCTAssertNil(sandbox.version(sandbox.app))
+        held.release()
+        restored = await Engine.recoverInterruptedSwaps(home: sandbox.home, run: sandbox.runner)
+        XCTAssertEqual(restored, [sandbox.app.path])
+        XCTAssertEqual(sandbox.version(sandbox.app), "1.0")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.home.appendingPathComponent(Engine.swapMarkerPath(item)).path))
+
+        // Or by the next update of that app, which then goes ahead.
+        try interrupt()
+        let zip = try sandbox.zippedApp(version: "2.0")
+        item.latest = LatestInfo(version: "2.0", url: zip.absoluteString, sha256: try sandbox.sha256(zip))
+        let o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, run: sandbox.runner)
+        XCTAssertTrue(o.ok, o.message + "\n" + o.output)
+        XCTAssertEqual(o.previous, "1.0")
+        XCTAssertEqual(sandbox.version(sandbox.app), "2.0")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.home.appendingPathComponent(Engine.swapMarkerPath(item)).path))
+    }
+
+    func testStagingNeedsFreeSpace() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        let item = sandbox.item(installed: "1.0")
+        let info = LatestInfo(version: "2.0", url: zip.absoluteString)
+        let r = await sandbox.runner(Engine.macStageScript(app: sandbox.app.path, bundleID: "com.example.t", name: "T", url: zip.absoluteString,
+                                                           info: info, stage: Engine.stagingPath(item), trust: false, reserveMB: 1 << 40), 60, nil)
+        XCTAssertFalse(r.ok)
+        XCTAssertTrue(Engine.failure(r).hasPrefix("Not enough disk space: needs about"), Engine.failure(r))
+        XCTAssertFalse(r.combined.contains("Downloading"), "fails before downloading")
+    }
+
+    /// GitHub's last answer stands in when it can't answer (here: a repo that doesn't exist).
+    func testGitHubLastAnswerIsUsedWhenGitHubRefuses() async throws {
+        let saved = GitHubCache.dir
+        GitHubCache.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-gh-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: GitHubCache.dir); GitHubCache.dir = saved }
+        let url = "https://api.github.com/repos/update-pls-test/does-not-exist-\(UUID().uuidString)/releases/latest"
+        let body = Data(#"{"tag_name":"v1.2.3"}"#.utf8)
+        GitHubCache.save(url, nil, etag: "W/\"x\"", body: body)
+        XCTAssertEqual(GitHubCache.load(url, nil)?.etag, "W/\"x\"")
+        let got = await LatestResolver.get(url)
+        XCTAssertEqual(got, body)
     }
 
     /// An app that wasn't open is updated in place and stays closed, even with reopening on.
@@ -445,6 +546,9 @@ final class UpdatePlsTests: XCTestCase {
         Log.appendRun(run, "output\n")
         XCTAssertEqual(try String(contentsOf: run, encoding: .utf8), "output\n")
         XCTAssertTrue(run.lastPathComponent.hasSuffix(" local cursor.log"))
+        let again = Log.newRun("local/cursor")
+        XCTAssertNotEqual(again, run)
+        XCTAssertEqual(try String(contentsOf: run, encoding: .utf8), "output\n", "a second run never empties the first one's file")
     }
 
     /// Downloads every desktop app in the catalog for this Mac through the real staging script and checks it
@@ -511,8 +615,10 @@ final class UpdatePlsTests: XCTestCase {
         model.updateAll()
         XCTAssertTrue(model.isActive(a) && model.isActive(b))
         XCTAssertTrue(model.updatable.isEmpty, "nothing queued can be started again")
+        XCTAssertTrue(model.keepsAwake)
         for _ in 0..<50 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.keepsAwake)
         XCTAssertEqual(runs, ["local/a", "local/b"], "each tool runs exactly once")
         XCTAssertEqual(model.activity[a.key], .done("Updated to 2.0"))
         XCTAssertEqual(model.activity[b.key], .failed("Still on 1.0 after updating. Updated"))

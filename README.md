@@ -28,7 +28,7 @@ Each tool is updated the same way it was installed:
 | pipx / uv / bun | `pipx upgrade` / `uv tool upgrade` / `bun add -g` |
 | Mac app download | the publisher's build, checked before it replaces the app (see below) |
 | winget (Windows) | `winget upgrade --id ...` |
-| apt (Linux) | needs sudo, so it shows a **Copy sudo command** button instead |
+| apt (Linux) | `apt-get install --only-upgrade` when sudo works without a password there; otherwise a **Copy sudo command** button. An app that is open there is left alone, with a message to quit it first |
 
 Before a Mac app download replaces the installed app, Update pls checks:
 
@@ -56,6 +56,8 @@ open "/Applications/Update pls.app"
 ## Progress, errors and logs
 
 Each tool shows what its update is doing right now: waiting in the queue, downloading (with a percentage), checking the signature, quitting, installing, reopening. Updates run one at a time per machine and machines in parallel; pressing Update or Update all again never starts a second install. When an update ends, the row says so: **Updated to 3.27.12**, or the reason it failed in red with **Retry** and a button that opens that update's full output. A notification sums up each batch. After updating, the version is read again, so "Updated" means the new version is really there.
+
+While updates run, the Mac doesn't idle-sleep. A desktop app's update first checks there is room for it, and fails before downloading if there isn't. One tool is never updated twice at once, even from the menu and the command line together. If an app's swap is ever cut off (Update pls killed, power lost), the app is put back the next time Update pls starts. GitHub lookups use your `gh` login (or `GH_TOKEN`) when there is one, are only fetched again when they changed, and fall back to the last answer if GitHub refuses.
 
 Everything is logged locally:
 

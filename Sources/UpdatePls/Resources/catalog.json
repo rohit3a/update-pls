@@ -19,8 +19,8 @@
     { "id": "aider", "name": "Aider", "brand": "Aider", "binaries": ["aider"], "pypi": "aider-chat", "latest": { "pypi": "aider-chat" } }
   ],
   "apps": [
-    { "id": "claude-desktop", "name": "Claude Desktop", "brand": "Claude", "mac": [{ "app": "Claude", "latest": { "cask": "claude" } }], "windows": ["Claude"] },
-    { "id": "codex-app", "name": "Codex App", "brand": "OpenAI", "mac": [{ "app": "Codex", "latest": { "cask": "codex-app" } }, { "app": "ChatGPT", "latest": { "cask": "chatgpt" } }], "windows": ["Codex", "ChatGPT"] },
+    { "id": "claude-desktop", "name": "Claude Desktop", "brand": "Claude", "mac": [{ "app": "Claude", "latest": { "cask": "claude" } }], "windows": ["Claude"], "linuxDeb": ["claude-desktop"] },
+    { "id": "codex-app", "name": "Codex App", "brand": "OpenAI", "mac": [{ "app": "Codex", "latest": { "cask": "codex-app" } }, { "app": "ChatGPT", "latest": { "cask": "chatgpt" } }], "windows": ["Codex", "ChatGPT"], "linuxDeb": ["chatgpt"] },
     { "id": "cursor", "name": "Cursor", "brand": "Cursor", "mac": [{ "app": "Cursor", "latest": { "cask": "cursor" } }], "windows": ["Cursor"], "linuxDeb": ["cursor"] },
     { "id": "antigravity", "name": "Antigravity", "brand": "Google", "mac": [{ "app": "Antigravity", "latest": { "cask": "antigravity" } }], "windows": ["Antigravity"], "linuxDeb": ["antigravity"] },
     { "id": "t3code", "name": "T3 Code", "brand": "T3 Code", "mac": [
@@ -29,7 +29,7 @@
         { "app": "T3 Code", "latest": { "cask": "t3-code" } }
       ], "windows": ["T3 Code"] },
     { "id": "kiro", "name": "Kiro", "brand": "Kiro", "mac": [{ "app": "Kiro", "latest": { "cask": "kiro" } }], "windows": ["Kiro"] },
-    { "id": "grok-bot", "name": "Grok Bot", "brand": "Grok", "mac": [{ "app": "Grok Bot", "latest": { "squirrel": "https://api2.cursor.sh/updates/api/update/{platform}/sand/0.0.1/0/stable" } }] },
+    { "id": "grok-bot", "name": "Grok Bot", "brand": "Grok", "mac": [{ "app": "Grok Bot", "latest": { "squirrel": "https://api2.cursor.sh/updates/api/update/{platform}/sand/0.0.1/0/stable" } }], "linuxDeb": ["grok-bot"] },
     { "id": "zed", "name": "Zed", "brand": "Zed", "mac": [{ "app": "Zed", "latest": { "cask": "zed" } }], "windows": ["Zed"] }
   ]
 }

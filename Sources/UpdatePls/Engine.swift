@@ -11,7 +11,8 @@ enum Method: Hashable {
     case cask(String)
     case macDirect(appPath: String, bundleID: String)
     case winget(String)
-    case deb(String)
+    /// An apt package; with `passwordless`, sudo works without a password on that machine, so Update pls runs it.
+    case deb(String, passwordless: Bool = false)
     case none
 
     var label: String {
@@ -104,13 +105,18 @@ struct Item: Identifiable, Hashable {
         case .macDirect: return nil
         case let .winget(id):
             return "winget upgrade --id \(Shell.psq(id)) --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity"
-        case let .deb(p): return "sudo apt-get update && sudo apt-get install --only-upgrade -y \(Shell.q(p))"
+        case let .deb(p, passwordless):
+            if !passwordless { return "sudo apt-get update && sudo apt-get install --only-upgrade -y \(Shell.q(p))" }
+            return "sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y \(Shell.q(p))"
         case .none: return nil
         }
     }
 
     /// Updates that need a password are shown as a command to copy instead of being run.
-    var needsSudo: Bool { command?.hasPrefix("sudo ") == true }
+    var needsSudo: Bool {
+        if case let .deb(_, passwordless) = method { return !passwordless }
+        return command?.hasPrefix("sudo ") == true
+    }
 
     /// Update pls can run this update itself.
     var canUpdate: Bool {
@@ -203,8 +209,12 @@ enum Engine {
         for r in p.debs {
             guard let def = catalog.apps.first(where: { $0.id == r.id }) else { continue }
             let candidate = r.candidate.isEmpty || r.candidate == "(none)" ? r.installed : r.candidate
-            items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: true, path: r.package,
-                              installed: r.installed, latest: LatestInfo(version: candidate), method: .deb(r.package)))
+            // "Codex App (ChatGPT)" when the package is one of several apps under one name, as on the Mac.
+            let app = def.mac?.first { $0.app.caseInsensitiveCompare(r.package) == .orderedSame }?.app
+            let name = app.map { (def.mac?.count ?? 0) > 1 && !$0.hasPrefix(def.name) ? "\(def.name) (\($0))" : $0 } ?? def.name
+            items.append(Item(machine: machine, os: p.os, defID: def.id, name: name, brand: def.brand ?? def.name, isApp: true, path: r.package,
+                              installed: r.installed, latest: LatestInfo(version: candidate), method: .deb(r.package, passwordless: p.sudo),
+                              running: r.running))
         }
         for def in catalog.apps {
             for want in def.windows ?? [] {
@@ -283,4 +293,11 @@ enum Engine {
     static func stagingPath(_ item: Item) -> String {
         "Library/Caches/Update pls/Staging/\(item.defID)-\((item.path as NSString).lastPathComponent)"
     }
+
+    /// Written just before a Mac app is swapped and removed right after, relative to $HOME. If it is still
+    /// there, the swap was cut off and the app may be missing (see `macRecoverScript`).
+    static func swapMarkerPath(_ item: Item) -> String {
+        "\(swapMarkersDir)/\(item.defID)-\((item.path as NSString).lastPathComponent)"
+    }
+    static let swapMarkersDir = "Library/Application Support/Update pls/Swapping"
 }

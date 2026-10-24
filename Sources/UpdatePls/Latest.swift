@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct LatestInfo: Hashable {
@@ -202,29 +203,111 @@ actor LatestResolver {
         return URLSession(configuration: c)
     }()
 
+    /// GitHub answers are revalidated with their ETag every time (so a new release shows up at once), and the
+    /// last answer stands in when GitHub refuses (rate limit) or can't be reached.
     static func get(_ url: String, accept: String? = nil) async -> Data? {
         guard let u = URL(string: url) else { return nil }
-        var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        req.setValue("update-pls", forHTTPHeaderField: "User-Agent")
-        if let accept { req.setValue(accept, forHTTPHeaderField: "Accept") }
+        let github = u.host == "api.github.com"
+        let cached = github ? GitHubCache.load(url, accept) : nil
+        var signed = false
+        func request() -> URLRequest {
+            var req = URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+            req.setValue("update-pls", forHTTPHeaderField: "User-Agent")
+            if let accept { req.setValue(accept, forHTTPHeaderField: "Accept") }
+            if github {
+                if let etag = cached?.etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+                signed = false
+                if let t = GitHubToken.value { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization"); signed = true }
+            }
+            return req
+        }
         do {
-            let (data, resp) = try await session.data(for: req)
+            var (data, resp) = try await session.data(for: request())
+            if (resp as? HTTPURLResponse)?.statusCode == 401, signed {
+                Log.error("latest: GitHub turned down the token; asking without it")
+                GitHubToken.invalidate()
+                (data, resp) = try await session.data(for: request())
+            }
             let http = resp as? HTTPURLResponse
+            if http?.statusCode == 304, let cached { return cached.body }
             guard http?.statusCode == 200 else {
                 var note = ""
                 if http?.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" { note = " (GitHub rate limit reached; it resets within an hour)" }
-                Log.error("latest: GET \(url) -> HTTP \(http?.statusCode ?? 0)\(note)")
-                return nil
+                Log.error("latest: GET \(url) -> HTTP \(http?.statusCode ?? 0)\(note)\(cached != nil ? "; using the last answer" : "")")
+                return cached?.body
             }
+            if github, let etag = http?.value(forHTTPHeaderField: "ETag") { GitHubCache.save(url, accept, etag: etag, body: data) }
             return data
         } catch {
-            Log.error("latest: GET \(url) -> \(error.localizedDescription)")
-            return nil
+            Log.error("latest: GET \(url) -> \(error.localizedDescription)\(cached != nil ? "; using the last answer" : "")")
+            return cached?.body
         }
     }
 
     static func json(_ url: String, accept: String? = nil) async -> [String: Any]? {
         guard let d = await get(url, accept: accept) else { return nil }
         return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    }
+}
+
+/// GitHub answers with their ETags, in ~/Library/Caches/Update pls/github.
+enum GitHubCache {
+    static var dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/Update pls/github")
+
+    private static func name(_ url: String, _ accept: String?) -> String {
+        SHA256.hash(data: Data((url + "|" + (accept ?? "")).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func load(_ url: String, _ accept: String?) -> (etag: String, body: Data)? {
+        let base = dir.appendingPathComponent(name(url, accept))
+        guard let etag = try? String(contentsOf: base.appendingPathExtension("etag"), encoding: .utf8),
+              let body = try? Data(contentsOf: base.appendingPathExtension("json")) else { return nil }
+        return (etag, body)
+    }
+
+    static func save(_ url: String, _ accept: String?, etag: String, body: Data) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let base = dir.appendingPathComponent(name(url, accept))
+        try? body.write(to: base.appendingPathExtension("json"), options: .atomic)
+        try? etag.write(to: base.appendingPathExtension("etag"), atomically: true, encoding: .utf8)
+    }
+}
+
+/// A GitHub token, for 5,000 lookups an hour instead of 60: GH_TOKEN or GITHUB_TOKEN, else the GitHub CLI's
+/// own (`gh auth token`). It is only ever sent to api.github.com and never logged.
+enum GitHubToken {
+    private static let lock = NSLock()
+    private static var found: String??
+
+    static var value: String? {
+        lock.withLock {
+            if found == nil { found = .some(find()) }
+            return found!
+        }
+    }
+
+    static func invalidate() { lock.withLock { found = .some(nil) } }
+
+    private static func find() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        for k in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            if let t = env[k]?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { Log.info("GitHub: signed in with \(k)"); return t }
+        }
+        for gh in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] where FileManager.default.isExecutableFile(atPath: gh) {
+            let p = Process(), out = Pipe()
+            p.executableURL = URL(fileURLWithPath: gh)
+            p.arguments = ["auth", "token", "--hostname", "github.com"]
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            let done = DispatchSemaphore(value: 0)
+            p.terminationHandler = { _ in done.signal() }
+            guard (try? p.run()) != nil else { continue }
+            if done.wait(timeout: .now() + 5) == .timedOut { p.terminate(); continue }
+            let t = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if p.terminationStatus == 0, !t.isEmpty, !t.contains(" ") { Log.info("GitHub: signed in with the GitHub CLI"); return t }
+        }
+        Log.info("GitHub: not signed in (60 lookups an hour)")
+        return nil
     }
 }

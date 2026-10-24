@@ -172,6 +172,42 @@ enum History {
     }
 }
 
+/// One update per tool at a time across every Update pls on this Mac (the menu and the command line).
+/// It is the kernel's file lock, so it goes away by itself if the process dies.
+final class ItemLock {
+    static var dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Update pls/Locks")
+    private var fd: Int32
+
+    private init(fd: Int32) { self.fd = fd }
+
+    /// Nil while another update holds it. If the lock file can't be made, the update goes ahead unlocked.
+    static func take(_ key: String) -> ItemLock? {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let name = key.map { $0.isLetter || $0.isNumber || "-._".contains($0) ? String($0) : "_" }.joined()
+        let fd = open(dir.appendingPathComponent(name + ".lock").path, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else { Log.error("lock \(key): \(String(cString: strerror(errno)))"); return ItemLock(fd: -1) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return nil }
+        return ItemLock(fd: fd)
+    }
+
+    func release() {
+        guard fd >= 0 else { return }
+        flock(fd, LOCK_UN); close(fd); fd = -1
+    }
+
+    deinit { release() }
+}
+
+/// Keeps the Mac from idle-sleeping while updates run (closing the lid still sleeps it).
+enum KeepAwake {
+    static func begin(_ reason: String) -> NSObjectProtocol {
+        ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: reason)
+    }
+    static func end(_ activity: NSObjectProtocol?) {
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+    }
+}
+
 extension Engine {
     /// Where another version of a tool comes from.
     enum VersionSource: Hashable {
@@ -185,6 +221,8 @@ extension Engine {
 
     /// Runs the update for one item. Desktop apps that are open are quit first and reopened if `relaunch`.
     static func update(_ item: Item, relaunch: Bool, reporter r: Reporter, dryRun: Bool = false) async -> UpdateOutcome {
+        guard let lock = ItemLock.take(item.key) else { return busy(item) }
+        defer { lock.release() }
         let start = Date()
         Log.info("update \(item.key): \(item.summary)\(dryRun ? " (dry run)" : "")\(r.runFile.map { "\nrun log: \($0.path)" } ?? "")")
         var outcome: UpdateOutcome
@@ -205,10 +243,17 @@ extension Engine {
         return outcome
     }
 
+    private static func busy(_ item: Item) -> UpdateOutcome {
+        Log.error("\(item.key): another Update pls is updating it")
+        return .fail("Another Update pls is updating \(item.name) right now")
+    }
+
     /// Installs one exact version: an older one to roll back, or a newer saved one to go forward again.
     /// Mac apps come from a saved copy (checked: same bundle id, valid signature) or the publisher's release;
     /// other tools reinstall that version with their package manager.
     static func install(_ item: Item, version: String, from source: VersionSource, relaunch: Bool, reporter r: Reporter) async -> UpdateOutcome {
+        guard let lock = ItemLock.take(item.key) else { return busy(item) }
+        defer { lock.release() }
         let start = Date()
         Log.info("install \(item.key): \(item.installed ?? "?") -> \(version) (\(source == .saved ? "saved copy" : "published"))")
         var outcome: UpdateOutcome
@@ -259,9 +304,15 @@ extension Engine {
         r.showLines = true
         r.phase("Updating with \(item.method.label)")
         if let f = r.runFile { Log.appendRun(f, "$ \(cmd)\n") }
+        // apt would replace an open app's files under it; there is no clean way to quit it from here.
+        var guardOpen = ""
+        if case let .deb(pkg, _) = item.method {
+            let msg = "\(item.name) is open on \(item.machine.name). Quit it there and press Retry."
+            guardOpen = Probe.debFunctions + "if up_deb_running \(Shell.q(pkg)); then echo \(Shell.q("UPFAIL " + msg)) >&2; exit 1; fi\n"
+        }
         let script = item.os == .windows
             ? Probe.windowsPrelude + cmd + "\nexit $LASTEXITCODE\n"
-            : Probe.unixPrelude + "set -e\n" + cmd + "\n"
+            : Probe.unixPrelude + guardOpen + "set -e\n" + cmd + "\n"
         let res = await Runner.run(item.machine, os: item.os, script: script, timeout: 900, onOutput: r.sink)
         guard res.ok else {
             var o = UpdateOutcome.fail(failure(res), output: res.combined)
@@ -297,8 +348,8 @@ extension Engine {
     /// Only the folder matters: the swap moves the whole bundle, which macOS allows even when App Management
     /// protection blocks writing inside it (so `-w "$APP"` would wrongly say no).
     /// Also lists updates the app's own updater has already downloaded (see `pending(_:)`).
-    static func macStateScript(app: String, bundleID: String) -> String {
-        macHeader(app: app, bundleID: bundleID) + """
+    static func macStateScript(app: String, bundleID: String, marker: String? = nil) -> String {
+        macHeader(app: app, bundleID: bundleID) + (marker.map(macRecoverSnippet) ?? "") + """
         [ -d "$APP" ] || up_fail "$APP is gone"
         report
         if [ -w "$(dirname "$APP")" ]; then echo "WRITABLE	1"; else echo "WRITABLE	0"; fi
@@ -324,6 +375,46 @@ extension Engine {
         """
     }
 
+    /// Puts an app back if its swap was cut off between moving it aside and moving the new version in.
+    /// Only run while holding that tool's `ItemLock`, so a swap in progress is never mistaken for a broken one.
+    static func macRecoverSnippet(marker: String) -> String {
+        """
+        MARK="$HOME/"\(Shell.q(marker))
+        if [ -f "$MARK" ]; then
+          A=$(sed -n 1p "$MARK"); K=$(sed -n 2p "$MARK")
+          if [ -n "$A" ] && [ ! -e "$A" ]; then
+            if [ -d "$K" ] && mkdir -p "$(dirname "$A")" && mv "$K" "$A"; then echo "RECOVERED	$A"; else echo "RECOVER_FAILED	$A"; fi
+          fi
+          rm -f "$MARK"
+        fi
+
+        """
+    }
+
+    static func macRecoverScript(marker: String) -> String {
+        "export LC_ALL=C\nPATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH\n" + macRecoverSnippet(marker: marker)
+    }
+
+    /// Puts back any app on this Mac whose swap was cut off (Update pls killed, power lost), skipping tools
+    /// another Update pls is updating right now. Returns the apps put back.
+    static func recoverInterruptedSwaps(home: URL = FileManager.default.homeDirectoryForCurrentUser,
+                                        run: ScriptRunner? = nil) async -> [String] {
+        let dir = home.appendingPathComponent(swapMarkersDir)
+        guard let markers = try? FileManager.default.contentsOfDirectory(atPath: dir.path), !markers.isEmpty else { return [] }
+        let run = run ?? { script, timeout, out in await Runner.run(.local, os: .mac, script: script, timeout: timeout, onOutput: out) }
+        var restored: [String] = []
+        for m in markers {
+            let lines = ((try? String(contentsOf: dir.appendingPathComponent(m), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+            guard lines.count >= 3, let lock = ItemLock.take(lines[2]) else { continue }
+            let res = await run(macRecoverScript(marker: "\(swapMarkersDir)/\(m)"), 120, nil)
+            lock.release()
+            let f = fields(res)
+            if let a = f["RECOVERED"] { Log.error("put \(a) back after an interrupted update"); restored.append(a) }
+            if let a = f["RECOVER_FAILED"] { Log.error("\(a) is missing after an interrupted update, and its previous version couldn't be put back") }
+        }
+        return restored
+    }
+
     /// Updates the app's own updater already downloaded, from the state script: ready bundles by version,
     /// and zips by sha512.
     static func pending(_ r: ShellResult) -> (apps: [(version: String, path: String)], zips: [(sha512: String, path: String)]) {
@@ -341,7 +432,7 @@ extension Engine {
     /// With `local`, takes the update the app's own updater already downloaded (a ready app, or a zip
     /// that is checked against the published hash) instead of downloading it again.
     static func macStageScript(app: String, bundleID: String, name: String, url: String, info: LatestInfo, stage: String,
-                               local: String? = nil, trust: Bool = true) -> String {
+                               local: String? = nil, trust: Bool = true, reserveMB: Int = 500) -> String {
         var verify = ""
         if let h = info.sha256 {
             verify = """
@@ -374,6 +465,16 @@ extension Engine {
             fi
             rm -f "$ST/dl"
             """
+        // The archive and the unpacked app sit side by side until the swap: about 1.5x the installed app,
+        // plus some room to spare. Fails before downloading anything rather than halfway through.
+        let space = """
+            need=$(( $(du -sk "$APP" | cut -f1) * 3 / 2 + \(reserveMB) * 1024 ))
+            free=$(df -k "$HOME" | awk 'NR == 2 { print $4 }')
+            size() { if [ "$1" -ge 1048576 ]; then echo "$(( ($1 + 524287) / 1048576 )) GB"; else echo "$(( ($1 + 1023) / 1024 )) MB"; fi; }
+            if [ -n "$free" ] && [ "$free" -lt "$need" ]; then
+              up_fail "Not enough disk space: needs about $(size "$need") free, $(size "$free") left. Free some up, or keep fewer versions for rollback in Settings."
+            fi
+            """
         let fetch: String
         if let local, local.hasSuffix(".app") || local.hasSuffix(".app/") {
             // Cloned, so the app's updater keeps its copy (instant and free on APFS).
@@ -386,11 +487,13 @@ extension Engine {
             fetch = """
             up_step \(Shell.q("Using the update \(name) already downloaded"))
             SRC=\(Shell.q(local)); [ -f "$SRC" ] || up_fail "The downloaded update is gone; press Retry"
+            \(space)
             cp -c "$SRC" "$ST/dl" 2>/dev/null || cp "$SRC" "$ST/dl"
             \(unpack)
             """
         } else {
             fetch = """
+            \(space)
             up_step \(Shell.q("Downloading \(name) \(info.version)"))
             curl -fL --retry 2 --connect-timeout 20 --speed-limit 4096 --speed-time 60 -# -o "$ST/dl" "$URL" || up_fail "Download failed"
             \(unpack)
@@ -454,7 +557,7 @@ extension Engine {
     /// Swaps another version in: a checked download (`staged`) or a saved copy of `version`.
     /// The version it replaces is saved for rollback, and only the newest `keep` saved versions are kept.
     static func macSwapScript(app: String, bundleID: String, name: String, staged: String?, version: String,
-                              stage: String, saved: String, keep: Int, trust: Bool = true) -> String {
+                              stage: String, saved: String, keep: Int, marker: String? = nil, key: String = "", trust: Bool = true) -> String {
         let appName = (app as NSString).lastPathComponent
         let source = staged.map { """
             NEW=\(Shell.q($0))
@@ -483,8 +586,12 @@ extension Engine {
         KEEP="$SV/${CUR:-unknown}"
         rm -rf "$KEEP/$AN"; mkdir -p "$KEEP"
         echo "BACKUP	$CUR"
+        # If this is cut off between the two moves, the next run puts the app back (see macRecoverSnippet).
+        MARK=\(marker.map { "\"$HOME/\"" + Shell.q($0) } ?? "\"$ST/.nomark\"")
+        mkdir -p "$(dirname "$MARK")"; printf '%s\\n%s\\n%s\\n' "$APP" "$KEEP/$AN" \(Shell.q(key)) > "$MARK"
         mv "$APP" "$KEEP/$AN" || up_fail "Couldn't move the current version aside"
-        if ! mv "$NEW" "$APP"; then rm -rf "$APP"; mv "$KEEP/$AN" "$APP"; up_fail "Couldn't install \(name) $WANT; the previous version was put back"; fi
+        if ! mv "$NEW" "$APP"; then rm -rf "$APP"; mv "$KEEP/$AN" "$APP"; rm -f "$MARK"; up_fail "Couldn't install \(name) $WANT; the previous version was put back"; fi
+        rm -f "$MARK"
         touch "$KEEP"
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
         NOW=$(current)
@@ -613,7 +720,8 @@ extension Engine {
         func discard() async { _ = await run("rm -rf \"$HOME/\"\(Shell.q(stage))", 60, nil) }
 
         r.phase("Checking \(name)")
-        let (s0, f0) = await step(macStateScript(app: app, bundleID: bid), 60)
+        let (s0, f0) = await step(macStateScript(app: app, bundleID: bid, marker: swapMarkerPath(item)), 60)
+        if let a = f0["RECOVERED"] { Log.error("\(item.key): put \(a) back after an interrupted update") }
         guard s0.ok else { return failed(s0) }
         // A dry run always downloads and checks the build, to prove the update would work.
         if done(f0["CURRENT"]) && !dryRun {
@@ -689,7 +797,8 @@ extension Engine {
         }
 
         let (s3, f3) = await step(macSwapScript(app: app, bundleID: bid, name: name, staged: staged, version: target, stage: stage,
-                                                saved: savedPath(item), keep: keep, trust: trust), 600)
+                                                saved: savedPath(item), keep: keep, marker: swapMarkerPath(item), key: item.key,
+                                                trust: trust), 600)
         guard s3.ok else { return await giveUp(failed(s3)) }
         if relaunch && wasRunning { await reopen(item, app: app, bundleID: bid, r, run: run) }
         let installed = f3["INSTALLED"].flatMap { $0.isEmpty ? nil : $0 }

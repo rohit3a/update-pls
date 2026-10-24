@@ -73,8 +73,14 @@ final class AppModel: ObservableObject {
     private var notified: Set<String>
     /// Jobs waiting, per machine. Each machine runs one job at a time (package managers lock); machines run in parallel.
     private var pending: [Machine: [(Item, Job)]] = [:]
-    /// Machines with jobs running or being re-checked.
-    @Published private var workers: Set<Machine> = []
+    /// Machines with jobs running or being re-checked. The Mac stays awake while there are any.
+    @Published private var workers: Set<Machine> = [] {
+        didSet {
+            if workers.isEmpty { KeepAwake.end(awake); awake = nil } else if awake == nil { awake = KeepAwake.begin("Updating tools") }
+        }
+    }
+    private var awake: NSObjectProtocol?
+    var keepsAwake: Bool { awake != nil }
     /// Finished jobs whose machine hasn't been re-checked yet: shown as done, but can't be started again.
     private var unverified: Set<String> = []
     private var batch: [(name: String, ok: Bool, message: String)] = []
@@ -95,7 +101,16 @@ final class AppModel: ObservableObject {
                  + "hosts: \(machines.map(\.id).joined(separator: ", ")); log: \(Log.file.path)")
         if canNotify { UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge]) { _, _ in } }
         scheduleChecks()
-        Task { await checkAll(.startup) }
+        Task {
+            let restored = await Engine.recoverInterruptedSwaps()
+            if !restored.isEmpty {
+                let content = UNMutableNotificationContent()
+                content.title = "Put back after an interrupted update"
+                content.body = restored.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+                post(content)
+            }
+            await checkAll(.startup)
+        }
     }
 
     var machines: [Machine] {
@@ -386,7 +401,11 @@ final class AppModel: ObservableObject {
 
     /// One prompt listing the open apps an update will quit and reopen, with "Don't ask again".
     private func confirmQuit(_ targets: [Item]) -> Bool {
-        let open = targets.filter { $0.isApp && ($0.machine.isLocal ? !LocalApps.instances($0.path).isEmpty : $0.running) }
+        // apt apps aren't quit (an open one stops with a message instead), so they aren't listed.
+        let open = targets.filter { t in
+            if case .deb = t.method { return false }
+            return t.isApp && (t.machine.isLocal ? !LocalApps.instances(t.path).isEmpty : t.running)
+        }
         guard !open.isEmpty, askBeforeQuitting else { return true }
         let alert = NSAlert()
         alert.messageText = open.count == 1 ? "\(open[0].name) is open" : "\(open.count) apps are open"

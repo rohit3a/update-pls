@@ -10,7 +10,7 @@ struct AppRecord {
     var running: Bool
 }
 
-struct DebRecord { var id, package, installed, candidate: String }
+struct DebRecord { var id, package, installed, candidate: String; var running = false }
 
 /// A version of a Mac app that Update pls saved when it replaced it.
 struct SavedRecord { var id, appName, version: String }
@@ -25,6 +25,8 @@ struct ProbeResult {
     var casks: Set<String> = []
     var hasBrew = false
     var debs: [DebRecord] = []
+    /// sudo works without a password (it is never asked for one over SSH).
+    var sudo = false
     var saved: [SavedRecord] = []
     var winget: [WingetRow] = []
 }
@@ -44,6 +46,23 @@ enum Probe {
     UP_P=$(up_login_path | sed -n 's/^__UPP__//p' | tail -1)
     export PATH="${UP_P:+$UP_P:}$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
     up_to() { t=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout "$t" "$@"; else "$@"; fi; }
+
+    """#
+
+    /// `up_deb_running pkg`: whether a desktop app installed by that apt package is open. It looks for programs
+    /// right in the package's own folder (/usr/lib/chatgpt, /opt/Grok Bot, ...), not helpers in subfolders.
+    static let debFunctions = #"""
+    up_deb_running() {
+      d=$(dpkg -L "$1" 2>/dev/null | grep -E '^/(opt|usr/lib|usr/share)/[^/]+$' \
+        | grep -v -E '^/usr/share/(doc|applications|icons|pixmaps|man|lintian|mime|metainfo|appdata|swcatalog|bash-completion|zsh|fish|polkit-1|menu)$' \
+        | while IFS= read -r x; do if [ -d "$x" ]; then echo "$x"; fi; done | head -1)
+      [ -n "$d" ] || return 1
+      for e in /proc/[0-9]*/exe; do
+        x=$(readlink "$e" 2>/dev/null) || continue
+        case "$x" in "$d"/*/*) ;; "$d"/*) return 0 ;; esac
+      done
+      return 1
+    }
 
     """#
 
@@ -94,7 +113,8 @@ enum Probe {
       v=$(dpkg-query -W -f='${Version}' "$2" 2>/dev/null) || return
       [ -n "$v" ] || return
       c=$(apt-cache policy "$2" 2>/dev/null | sed -n 's/^ *Candidate: *//p')
-      printf 'DEB\t%s\t%s\t%s\t%s\n' "$1" "$2" "$v" "$c"
+      if up_deb_running "$2"; then r=1; else r=0; fi
+      printf 'DEB\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$v" "$c" "$r"
     }
     printf 'OS\t%s\t%s\n' "$(uname -s)" "$(uname -m)"
     if command -v brew >/dev/null 2>&1; then
@@ -105,13 +125,13 @@ enum Probe {
     """#
 
     static func unixScript(_ c: Catalog) -> String {
-        var s = unixPrelude + unixFunctions
+        var s = unixPrelude + debFunctions + unixFunctions
         for d in c.clis {
             s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + "\n"
         }
         s += "if [ \"$(uname -s)\" = Darwin ]; then\n"
         for d in c.apps { for v in d.mac ?? [] { s += "  up_app \(Shell.q(d.id)) \(Shell.q(v.app))\n" } }
-        s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  :\n"
+        s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  if sudo -n true >/dev/null 2>&1; then printf 'SUDO\\t1\\n'; fi\n"
         for d in c.apps { for p in d.linuxDeb ?? [] { s += "  up_deb \(Shell.q(d.id)) \(Shell.q(p))\n" } }
         s += "fi\n"
         // The exit status of the last probe line means nothing; don't report it as a failed scan.
@@ -177,8 +197,9 @@ enum Probe {
                 r.apps.append(AppRecord(id: f[1], appName: f[2], path: f[3], version: f[4], bundleID: f[5], running: f[6] == "1"))
             case "SAVED" where f.count >= 4 && !f[3].isEmpty:
                 r.saved.append(SavedRecord(id: f[1], appName: f[2], version: f[3]))
+            case "SUDO": r.sudo = true
             case "DEB" where f.count >= 5:
-                r.debs.append(DebRecord(id: f[1], package: f[2], installed: f[3], candidate: f[4]))
+                r.debs.append(DebRecord(id: f[1], package: f[2], installed: f[3], candidate: f[4], running: f.count >= 6 && f[5] == "1"))
             case "WL" where f.count >= 2:
                 wl.append(f.dropFirst().joined(separator: "\t"))
             default: break

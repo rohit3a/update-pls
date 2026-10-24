@@ -129,6 +129,8 @@ enum CLI {
             print("Log: \(Log.file.path)")
             return 0
         }
+        let awake = KeepAwake.begin("Updating tools")
+        defer { KeepAwake.end(awake) }
         if args[0] == "versions" || args[0] == "install" { return await versions(args) }
         let dryRun = args.contains("--dry-run")
         let rest = args.dropFirst().filter { $0 != "--dry-run" }

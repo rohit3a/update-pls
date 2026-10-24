@@ -26,14 +26,21 @@ enum Log {
     }
 
     /// A new per-update output file, e.g. runs/2026-10-24 12.16.03 local cursor.log.
+    /// Never reuses a file: two updates of the same tool in the same second (say, from the menu and the
+    /// command line) each get their own.
     static func newRun(_ name: String) -> URL {
-        let url = runsDir.appendingPathComponent("\(fileStamp()) \(name.replacingOccurrences(of: "/", with: " ")).log")
-        queue.sync {
+        let base = "\(fileStamp()) \(name.replacingOccurrences(of: "/", with: " "))"
+        return queue.sync {
             try? FileManager.default.createDirectory(at: runsDir, withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+            var url = runsDir.appendingPathComponent(base + ".log")
+            for n in 2...99 {
+                let fd = open(url.path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+                if fd >= 0 { close(fd); break }
+                url = runsDir.appendingPathComponent("\(base) \(n).log")
+            }
             pruneRuns()
+            return url
         }
-        return url
     }
 
     static func appendRun(_ url: URL, _ text: String) {
