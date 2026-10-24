@@ -8,19 +8,19 @@
     { "id": "gemini", "name": "Gemini CLI", "brand": "Google", "binaries": ["gemini"], "npm": ["@google/gemini-cli"], "latest": { "npm": "@google/gemini-cli" } },
     { "id": "copilot", "name": "GitHub Copilot CLI", "brand": "GitHub", "binaries": ["copilot"], "npm": ["@github/copilot"], "latest": { "npm": "@github/copilot" } },
     { "id": "amp", "name": "Amp", "brand": "Amp", "binaries": ["amp"], "npm": ["@ampcode/cli", "@sourcegraph/amp"], "selfUpdate": "update", "latest": { "npm": "@ampcode/cli" } },
-    { "id": "droid", "name": "Factory Droid", "brand": "Factory", "binaries": ["droid"], "npm": ["@factory/cli"], "latest": { "npm": "@factory/cli" } },
+    { "id": "droid", "name": "Factory Droid", "brand": "Factory", "binaries": ["droid"], "npm": ["droid", "@factory/cli"], "selfUpdate": "update", "installVersion": "update --version {version}", "latest": { "npm": "droid" } },
     { "id": "qwen", "name": "Qwen Code", "brand": "Qwen", "binaries": ["qwen"], "npm": ["@qwen-code/qwen-code"], "latest": { "npm": "@qwen-code/qwen-code" } },
     { "id": "crush", "name": "Crush", "brand": "Charm", "binaries": ["crush"], "npm": ["@charmland/crush"], "latest": { "npm": "@charmland/crush" } },
     { "id": "kilocode", "name": "Kilo Code CLI", "brand": "Kilo Code", "binaries": ["kilocode", "kilo"], "npm": ["@kilocode/cli"], "latest": { "npm": "@kilocode/cli" } },
     { "id": "cline", "name": "Cline CLI", "brand": "Cline", "binaries": ["cline"], "npm": ["cline"], "latest": { "npm": "cline" } },
     { "id": "auggie", "name": "Auggie", "brand": "Augment", "binaries": ["auggie"], "npm": ["@augmentcode/auggie"], "latest": { "npm": "@augmentcode/auggie" } },
     { "id": "goose", "name": "Goose", "brand": "Goose", "binaries": ["goose"], "selfUpdate": "update", "latest": { "github": "block/goose" } },
-    { "id": "agy", "name": "Antigravity CLI", "brand": "Google", "binaries": ["agy"] },
+    { "id": "agy", "name": "Antigravity CLI", "brand": "Google", "binaries": ["agy"], "selfUpdate": "update", "latest": { "scrape": { "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/", "regex": "Stable Version: ([0-9]+(?:\\.[0-9]+)*)" } } },
     { "id": "aider", "name": "Aider", "brand": "Aider", "binaries": ["aider"], "pypi": "aider-chat", "latest": { "pypi": "aider-chat" } }
   ],
   "apps": [
-    { "id": "claude-desktop", "name": "Claude Desktop", "brand": "Claude", "mac": [{ "app": "Claude", "latest": { "cask": "claude" } }], "windows": ["Claude"] },
-    { "id": "codex-app", "name": "Codex App", "brand": "OpenAI", "mac": [{ "app": "Codex", "latest": { "cask": "codex-app" } }, { "app": "ChatGPT", "latest": { "cask": "chatgpt" } }], "windows": ["Codex", "ChatGPT"] },
+    { "id": "claude-desktop", "name": "Claude Desktop", "brand": "Claude", "mac": [{ "app": "Claude", "latest": { "cask": "claude" } }], "windows": ["Claude"], "linuxDeb": ["claude-desktop"] },
+    { "id": "codex-app", "name": "Codex App", "brand": "OpenAI", "mac": [{ "app": "Codex", "latest": { "cask": "codex-app" } }, { "app": "ChatGPT", "latest": { "cask": "chatgpt" } }], "windows": ["Codex", "ChatGPT"], "linuxDeb": ["chatgpt"] },
     { "id": "cursor", "name": "Cursor", "brand": "Cursor", "mac": [{ "app": "Cursor", "latest": { "cask": "cursor" } }], "windows": ["Cursor"], "linuxDeb": ["cursor"] },
     { "id": "antigravity", "name": "Antigravity", "brand": "Google", "mac": [{ "app": "Antigravity", "latest": { "cask": "antigravity" } }], "windows": ["Antigravity"], "linuxDeb": ["antigravity"] },
     { "id": "t3code", "name": "T3 Code", "brand": "T3 Code", "mac": [
@@ -29,7 +29,7 @@
         { "app": "T3 Code", "latest": { "cask": "t3-code" } }
       ], "windows": ["T3 Code"] },
     { "id": "kiro", "name": "Kiro", "brand": "Kiro", "mac": [{ "app": "Kiro", "latest": { "cask": "kiro" } }], "windows": ["Kiro"] },
-    { "id": "grok-bot", "name": "Grok Bot", "brand": "Grok", "mac": [{ "app": "Grok Bot", "latest": { "squirrel": "https://api2.cursor.sh/updates/api/update/{platform}/sand/0.0.1/0/stable" } }] },
+    { "id": "grok-bot", "name": "Grok Bot", "brand": "Grok", "mac": [{ "app": "Grok Bot", "latest": { "squirrel": "https://api2.cursor.sh/updates/api/update/{platform}/sand/0.0.1/0/stable" } }], "linuxDeb": ["grok-bot"] },
     { "id": "zed", "name": "Zed", "brand": "Zed", "mac": [{ "app": "Zed", "latest": { "cask": "zed" } }], "windows": ["Zed"] }
   ]
 }

@@ -39,24 +39,39 @@ enum Runner {
         return "powershell -NoProfile -NonInteractive -EncodedCommand " + data.base64EncodedString()
     }()
 
-    enum Detect { case os(OSKind), offline(String) }
+    enum Detect: Equatable { case os(OSKind), offline(String) }
 
     static func detectOS(_ m: Machine) async -> Detect {
         if m.isLocal { return .os(.mac) }
         let r = await Shell.run("/usr/bin/ssh", sshOptions + [m.id, "uname -s"], timeout: 20)
-        if r.status == 255 || r.timedOut {
-            let msg = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            return .offline(msg.isEmpty ? "Unreachable" : msg)
-        }
+        let d = classify(r)
+        Log.info("\(m.id): \(d == .os(.mac) ? "macOS" : d == .os(.linux) ? "Linux" : d == .os(.windows) ? "Windows" : "offline") (ssh exit \(r.status)\(r.timedOut ? ", timed out" : ""))"
+                 + (r.ok ? "" : "\n" + r.combined.trimmingCharacters(in: .whitespacesAndNewlines)))
+        return d
+    }
+
+    /// Reads `ssh host uname -s`. Only a host that really looks like Windows is treated as one.
+    static func classify(_ r: ShellResult) -> Detect {
+        let msg = r.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.status == 255 || r.timedOut { return .offline(msg.isEmpty ? (r.timedOut ? "Timed out" : "Unreachable") : msg) }
         let s = r.stdout.lowercased()
         if r.ok && s.contains("darwin") { return .os(.mac) }
         if r.ok && s.contains("linux") { return .os(.linux) }
-        return .os(.windows)
+        if s.contains("mingw") || s.contains("msys") || s.contains("cygwin") { return .os(.windows) }
+        let lower = msg.lowercased()
+        if lower.contains("not recognized") || lower.contains("commandnotfoundexception") || lower.contains("windows") {
+            return .os(.windows)
+        }
+        return .offline("Couldn't tell what system this is" + (msg.isEmpty ? "" : ": \(msg)"))
     }
 
-    static func run(_ m: Machine, os: OSKind, script: String, timeout: TimeInterval) async -> ShellResult {
-        if m.isLocal { return await Shell.run("/bin/bash", ["-s"], input: script, timeout: timeout) }
+    /// Runs a script on the machine. POSIX scripts are wrapped in `{ ... } </dev/null` so bash reads all of it
+    /// before running anything, and no command inside can swallow the rest of the script from stdin.
+    static func run(_ m: Machine, os: OSKind, script: String, timeout: TimeInterval,
+                    onOutput: (@Sendable (String) -> Void)? = nil) async -> ShellResult {
+        let body = os == .windows ? script : "{\n" + script + "\n} </dev/null\n"
+        if m.isLocal { return await Shell.run("/bin/bash", ["-s"], input: body, timeout: timeout, onOutput: onOutput) }
         let remote = os == .windows ? psBootstrap : "bash -s"
-        return await Shell.run("/usr/bin/ssh", sshOptions + [m.id, remote], input: script, timeout: timeout)
+        return await Shell.run("/usr/bin/ssh", sshOptions + [m.id, remote], input: body, timeout: timeout, onOutput: onOutput)
     }
 }

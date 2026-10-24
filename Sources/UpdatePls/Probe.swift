@@ -10,7 +10,10 @@ struct AppRecord {
     var running: Bool
 }
 
-struct DebRecord { var id, package, installed, candidate: String }
+struct DebRecord { var id, package, installed, candidate: String; var running = false }
+
+/// A version of a Mac app that Update pls saved when it replaced it.
+struct SavedRecord { var id, appName, version: String }
 
 struct WingetRow { var name, id, version, available: String }
 
@@ -22,7 +25,14 @@ struct ProbeResult {
     var casks: Set<String> = []
     var hasBrew = false
     var debs: [DebRecord] = []
+    /// sudo works without a password (it is never asked for one over SSH).
+    var sudo = false
+    var saved: [SavedRecord] = []
     var winget: [WingetRow] = []
+    /// winget printed a list this parser can't read (not in English).
+    var wingetUnreadable = false
+    /// Apps put back (or not) after an interrupted swap, as RECOVERED / RECOVER_FAILED lines.
+    var recovery: [String] = []
 }
 
 enum Probe {
@@ -40,6 +50,53 @@ enum Probe {
     UP_P=$(up_login_path | sed -n 's/^__UPP__//p' | tail -1)
     export PATH="${UP_P:+$UP_P:}$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
     up_to() { t=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout "$t" "$@"; else "$@"; fi; }
+
+    """#
+
+    /// `up_deb_running pkg`: whether a desktop app installed by that apt package is open. It looks for programs
+    /// right in the package's own folder (/usr/lib/chatgpt, /opt/Grok Bot, ...), not helpers in subfolders.
+    static let debFunctions = #"""
+    up_deb_pids() {
+      d=$(dpkg -L "$1" 2>/dev/null | grep -E '^/(opt|usr/lib|usr/share)/[^/]+$' \
+        | grep -v -E '^/usr/share/(doc|applications|icons|pixmaps|man|lintian|mime|metainfo|appdata|swcatalog|bash-completion|zsh|fish|polkit-1|menu)$' \
+        | while IFS= read -r x; do if [ -d "$x" ]; then echo "$x"; fi; done | head -1)
+      [ -n "$d" ] || return 0
+      # One find reads every process's program; a readlink each would start hundreds of processes.
+      find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null | while IFS=$'\t' read -r h x; do
+        case "$x" in "$d"/*/*) ;; "$d"/*) echo "${h#/proc/}" ;; esac
+      done
+    }
+    up_deb_running() { [ -n "$(up_deb_pids "$1")" ]; }
+
+    """#
+
+    /// `up_deb_quit pkg dir` asks an open app to quit as closing its windows would (SIGTERM to its top processes,
+    /// never SIGKILL) and fails if it is still open after 30 seconds. It first saves the desktop session's
+    /// environment in dir, so `up_deb_open pkg dir` can start the app again there, as its menu entry would.
+    static let debQuitFunctions = #"""
+    up_deb_quit() {
+      all=" $(up_deb_pids "$1" | tr '\n' ' ') "
+      top=""
+      for p in $all; do
+        pp=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$p/status" 2>/dev/null)
+        case "$all" in *" $pp "*) ;; *) top="$top $p" ;; esac
+      done
+      for e in $(for p in $top; do echo "/proc/$p/environ"; done) /proc/[0-9]*/environ; do
+        if [ -O "$e" ] && tr '\0' '\n' < "$e" 2>/dev/null | grep -q -E '^(WAYLAND_DISPLAY|DISPLAY)='; then
+          tr '\0' '\n' < "$e" | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_[A-Z_]+|DBUS_SESSION_BUS_ADDRESS|DESKTOP_SESSION|HOME|USER|LANG|PATH)=' > "$2/env"
+          break
+        fi
+      done
+      if [ -n "$top" ]; then kill -TERM $top 2>/dev/null || true; fi
+      for i in $(seq 1 60); do up_deb_running "$1" || return 0; sleep 0.5; done
+      return 1
+    }
+    up_deb_open() {
+      f=$(dpkg -L "$1" 2>/dev/null | grep -E '^/usr/share/applications/[^/]+\.desktop$' | head -1)
+      [ -n "$f" ] && [ -s "$2/env" ] && command -v gio >/dev/null 2>&1 || return 1
+      mapfile -t envs < "$2/env"
+      setsid -f env "${envs[@]}" gio launch "$f" </dev/null >/dev/null 2>&1
+    }
 
     """#
 
@@ -80,6 +137,9 @@ enum Probe {
         run=0
         ps -axo command= | grep -F "$a/Contents/MacOS/" | grep -v grep >/dev/null && run=1
         printf 'APP\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$a" "$v" "$bid" "$run"
+        for s in "$HOME/Library/Application Support/Update pls/Backups/$1"/*/"$2.app" "$HOME/Library/Application Support/Update pls/Backups/$1/$2.app"; do
+          [ -d "$s" ] && printf 'SAVED\t%s\t%s\t%s\n' "$1" "$2" "$(defaults read "$s/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
+        done
         return
       done
     }
@@ -87,7 +147,10 @@ enum Probe {
       v=$(dpkg-query -W -f='${Version}' "$2" 2>/dev/null) || return
       [ -n "$v" ] || return
       c=$(apt-cache policy "$2" 2>/dev/null | sed -n 's/^ *Candidate: *//p')
-      printf 'DEB\t%s\t%s\t%s\t%s\n' "$1" "$2" "$v" "$c"
+      # apt's own ordering decides (epochs, ~rc): a candidate that isn't newer is no update.
+      if [ -z "$c" ] || [ "$c" = "(none)" ] || ! dpkg --compare-versions "$c" gt "$v"; then c=$v; fi
+      if up_deb_running "$2"; then r=1; else r=0; fi
+      printf 'DEB\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$v" "$c" "$r"
     }
     printf 'OS\t%s\t%s\n' "$(uname -s)" "$(uname -m)"
     if command -v brew >/dev/null 2>&1; then
@@ -98,15 +161,35 @@ enum Probe {
     """#
 
     static func unixScript(_ c: Catalog) -> String {
-        var s = unixPrelude + unixFunctions
-        for d in c.clis {
-            s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + "\n"
+        var s = unixPrelude + debFunctions + unixFunctions
+        // Each tool is read at the same time (a --version or apt-cache can take seconds), into its own file,
+        // and the files are printed in order at the end.
+        s += "UP_O=$(mktemp -d 2>/dev/null) || { UP_O=\"$HOME/.update-pls-probe.$$\"; mkdir -p \"$UP_O\"; }\n"
+        for (n, d) in c.clis.enumerated() {
+            s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + " > \"$UP_O/c\(String(format: "%03d", n))\" &\n"
         }
         s += "if [ \"$(uname -s)\" = Darwin ]; then\n"
+        // A swap cut off on this Mac leaves the app missing, so it wouldn't even be listed: put it back first.
+        // Only markers older than 15 minutes, which no swap still running can have.
+        s += "  for MARK in \"$HOME/\(Engine.swapMarkersDir)\"/*; do\n"
+            + "    if [ -f \"$MARK\" ] && [ -n \"$(find \"$MARK\" -mmin +15 2>/dev/null)\" ]; then\n"
+            + Engine.macRecoverBody + "    fi\n  done\n"
         for d in c.apps { for v in d.mac ?? [] { s += "  up_app \(Shell.q(d.id)) \(Shell.q(v.app))\n" } }
-        s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  :\n"
-        for d in c.apps { for p in d.linuxDeb ?? [] { s += "  up_deb \(Shell.q(d.id)) \(Shell.q(p))\n" } }
+        let debs = c.apps.flatMap { $0.linuxDeb ?? [] }.map(Shell.q).joined(separator: " ")
+        s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  if sudo -n true >/dev/null 2>&1; then\n    printf 'SUDO\\t1\\n'\n"
+        // apt only learns about new versions when its lists are refreshed, which Ubuntu does about twice a day.
+        if !debs.isEmpty {
+            s += "    if dpkg-query -W -f='${Status}\\n' \(debs) 2>/dev/null | grep -q 'ok installed' "
+                + "&& [ -z \"$(find /var/lib/apt/lists -maxdepth 1 -type f -name '*Release' -mmin -720 2>/dev/null | head -1)\" ]; then\n"
+                + "      up_to 90 sudo -n apt-get update -qq >/dev/null 2>&1 || true\n    fi\n"
+        }
+        s += "  fi\n"
+        for (n, p) in c.apps.flatMap({ d in (d.linuxDeb ?? []).map { (d.id, $0) } }).enumerated() {
+            s += "  up_deb \(Shell.q(p.0)) \(Shell.q(p.1)) > \"$UP_O/d\(String(format: "%03d", n))\" &\n"
+        }
         s += "fi\n"
+        // The exit status of the last probe line means nothing; don't report it as a failed scan.
+        s += "wait\ncat \"$UP_O\"/* 2>/dev/null\nrm -rf \"$UP_O\"\ntrue\n"
         return s
     }
 
@@ -166,16 +249,23 @@ enum Probe {
                                         package: f[6], packageVersion: f[7], npmBin: f[8], writable: f[9] == "1"))
             case "APP" where f.count >= 7:
                 r.apps.append(AppRecord(id: f[1], appName: f[2], path: f[3], version: f[4], bundleID: f[5], running: f[6] == "1"))
+            case "SAVED" where f.count >= 4 && !f[3].isEmpty:
+                r.saved.append(SavedRecord(id: f[1], appName: f[2], version: f[3]))
+            case "SUDO": r.sudo = true
             case "DEB" where f.count >= 5:
-                r.debs.append(DebRecord(id: f[1], package: f[2], installed: f[3], candidate: f[4]))
+                r.debs.append(DebRecord(id: f[1], package: f[2], installed: f[3], candidate: f[4], running: f.count >= 6 && f[5] == "1"))
             case "WL" where f.count >= 2:
                 wl.append(f.dropFirst().joined(separator: "\t"))
+            case "RECOVERED", "RECOVER_FAILED": r.recovery.append(line)
             default: break
             }
         }
         r.winget = parseWinget(wl)
+        r.wingetUnreadable = !wl.isEmpty && !wl.contains(where: isWingetHeader)
         return r
     }
+
+    static func isWingetHeader(_ line: String) -> Bool { line.contains("Name") && line.contains(" Id ") && line.contains("Version") }
 
     /// Parses `winget list`'s fixed-width table using the header's column positions.
     static func parseWinget(_ lines: [String]) -> [WingetRow] {
@@ -183,7 +273,7 @@ enum Probe {
             let s = l.components(separatedBy: "\r").last ?? l
             return s.trimmingCharacters(in: CharacterSet(charactersIn: " ").union(.controlCharacters)).isEmpty ? "" : s
         }
-        guard let h = clean.firstIndex(where: { $0.contains("Name") && $0.contains(" Id ") && $0.contains("Version") }) else { return [] }
+        guard let h = clean.firstIndex(where: isWingetHeader) else { return [] }
         let header = Array(clean[h].drop(while: { $0 != "N" }))
         func col(_ name: String) -> Int? {
             let hs = String(header)

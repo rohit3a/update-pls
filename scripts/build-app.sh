@@ -35,8 +35,13 @@ PLIST
 codesign --force --sign "${SIGN_IDENTITY:--}" "$APP"
 echo "Built $APP"
 if [ "${1:-}" = "--install" ]; then
+  # Reopened afterwards if it was running, so the menu bar icon doesn't just vanish.
+  WAS_RUNNING=0
+  if pgrep -f "/Update pls.app/Contents/MacOS/UpdatePls" >/dev/null; then WAS_RUNNING=1; fi
   osascript -e 'tell application id "com.rohit3a.updatepls" to quit' >/dev/null 2>&1 || true
+  for _ in $(seq 1 50); do pgrep -f "/Update pls.app/Contents/MacOS/UpdatePls" >/dev/null || break; sleep 0.1; done
   rm -rf "/Applications/Update pls.app"
   ditto "$APP" "/Applications/Update pls.app"
   echo "Installed to /Applications"
+  if [ $WAS_RUNNING = 1 ]; then open -g "/Applications/Update pls.app"; echo "Reopened"; fi
 fi
