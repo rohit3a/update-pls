@@ -258,18 +258,16 @@ enum GitHubCache {
         SHA256.hash(data: Data((url + "|" + (accept ?? "")).utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// One file per answer, its ETag on the first line: written in one go, so the two always match.
     static func load(_ url: String, _ accept: String?) -> (etag: String, body: Data)? {
-        let base = dir.appendingPathComponent(name(url, accept))
-        guard let etag = try? String(contentsOf: base.appendingPathExtension("etag"), encoding: .utf8),
-              let body = try? Data(contentsOf: base.appendingPathExtension("json")) else { return nil }
-        return (etag, body)
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent(name(url, accept) + ".cache")),
+              let nl = data.firstIndex(of: 0x0A) else { return nil }
+        return (String(decoding: data[..<nl], as: UTF8.self), Data(data[(nl + 1)...]))
     }
 
     static func save(_ url: String, _ accept: String?, etag: String, body: Data) {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let base = dir.appendingPathComponent(name(url, accept))
-        try? body.write(to: base.appendingPathExtension("json"), options: .atomic)
-        try? etag.write(to: base.appendingPathExtension("etag"), atomically: true, encoding: .utf8)
+        try? (Data((etag + "\n").utf8) + body).write(to: dir.appendingPathComponent(name(url, accept) + ".cache"), options: .atomic)
     }
 }
 

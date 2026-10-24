@@ -29,6 +29,10 @@ struct ProbeResult {
     var sudo = false
     var saved: [SavedRecord] = []
     var winget: [WingetRow] = []
+    /// winget printed a list this parser can't read (not in English).
+    var wingetUnreadable = false
+    /// Apps put back (or not) after an interrupted swap, as RECOVERED / RECOVER_FAILED lines.
+    var recovery: [String] = []
 }
 
 enum Probe {
@@ -113,6 +117,8 @@ enum Probe {
       v=$(dpkg-query -W -f='${Version}' "$2" 2>/dev/null) || return
       [ -n "$v" ] || return
       c=$(apt-cache policy "$2" 2>/dev/null | sed -n 's/^ *Candidate: *//p')
+      # apt's own ordering decides (epochs, ~rc): a candidate that isn't newer is no update.
+      if [ -z "$c" ] || [ "$c" = "(none)" ] || ! dpkg --compare-versions "$c" gt "$v"; then c=$v; fi
       if up_deb_running "$2"; then r=1; else r=0; fi
       printf 'DEB\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$v" "$c" "$r"
     }
@@ -130,8 +136,21 @@ enum Probe {
             s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + "\n"
         }
         s += "if [ \"$(uname -s)\" = Darwin ]; then\n"
+        // A swap cut off on this Mac leaves the app missing, so it wouldn't even be listed: put it back first.
+        // Only markers older than 15 minutes, which no swap still running can have.
+        s += "  for MARK in \"$HOME/\(Engine.swapMarkersDir)\"/*; do\n"
+            + "    if [ -f \"$MARK\" ] && [ -n \"$(find \"$MARK\" -mmin +15 2>/dev/null)\" ]; then\n"
+            + Engine.macRecoverBody + "    fi\n  done\n"
         for d in c.apps { for v in d.mac ?? [] { s += "  up_app \(Shell.q(d.id)) \(Shell.q(v.app))\n" } }
-        s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  if sudo -n true >/dev/null 2>&1; then printf 'SUDO\\t1\\n'; fi\n"
+        let debs = c.apps.flatMap { $0.linuxDeb ?? [] }.map(Shell.q).joined(separator: " ")
+        s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  if sudo -n true >/dev/null 2>&1; then\n    printf 'SUDO\\t1\\n'\n"
+        // apt only learns about new versions when its lists are refreshed, which Ubuntu does about twice a day.
+        if !debs.isEmpty {
+            s += "    if dpkg-query -W -f='${Status}\\n' \(debs) 2>/dev/null | grep -q 'ok installed' "
+                + "&& [ -z \"$(find /var/lib/apt/lists -maxdepth 1 -type f -name '*Release' -mmin -720 2>/dev/null | head -1)\" ]; then\n"
+                + "      up_to 90 sudo -n apt-get update -qq >/dev/null 2>&1 || true\n    fi\n"
+        }
+        s += "  fi\n"
         for d in c.apps { for p in d.linuxDeb ?? [] { s += "  up_deb \(Shell.q(d.id)) \(Shell.q(p))\n" } }
         s += "fi\n"
         // The exit status of the last probe line means nothing; don't report it as a failed scan.
@@ -202,12 +221,16 @@ enum Probe {
                 r.debs.append(DebRecord(id: f[1], package: f[2], installed: f[3], candidate: f[4], running: f.count >= 6 && f[5] == "1"))
             case "WL" where f.count >= 2:
                 wl.append(f.dropFirst().joined(separator: "\t"))
+            case "RECOVERED", "RECOVER_FAILED": r.recovery.append(line)
             default: break
             }
         }
         r.winget = parseWinget(wl)
+        r.wingetUnreadable = !wl.isEmpty && !wl.contains(where: isWingetHeader)
         return r
     }
+
+    static func isWingetHeader(_ line: String) -> Bool { line.contains("Name") && line.contains(" Id ") && line.contains("Version") }
 
     /// Parses `winget list`'s fixed-width table using the header's column positions.
     static func parseWinget(_ lines: [String]) -> [WingetRow] {
@@ -215,7 +238,7 @@ enum Probe {
             let s = l.components(separatedBy: "\r").last ?? l
             return s.trimmingCharacters(in: CharacterSet(charactersIn: " ").union(.controlCharacters)).isEmpty ? "" : s
         }
-        guard let h = clean.firstIndex(where: { $0.contains("Name") && $0.contains(" Id ") && $0.contains("Version") }) else { return [] }
+        guard let h = clean.firstIndex(where: isWingetHeader) else { return [] }
         let header = Array(clean[h].drop(while: { $0 != "N" }))
         func col(_ name: String) -> Int? {
             let hs = String(header)

@@ -16,6 +16,10 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(Version.isNewer("2026.10.16-e3cb207", than: "2026.10.01-e373342"))
         XCTAssertTrue(Version.isNewer("1.0.0", than: "1.0.0-beta.2"))
         XCTAssertFalse(Version.isNewer("v0.163.0", than: "0.163.0"))
+        // Build metadata doesn't order versions; a component with a suffix still counts by its number.
+        XCTAssertTrue(Version.isNewer("1.2.4+build.7", than: "1.2.3"))
+        XCTAssertFalse(Version.isNewer("1.2.3+build.9", than: "1.2.3"))
+        XCTAssertTrue(Version.isNewer("1.3.0~rc1", than: "1.2.9"))
         // Versions read from an app mid-install must not crash the comparison.
         for odd in ["", "-", "v", "-beta", "1.0-"] {
             _ = Version.isNewer(odd, than: "1.0.0")
@@ -54,7 +58,11 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(items.map(\.name), ["Claude Desktop", "Codex App (ChatGPT)"])
         XCTAssertEqual(items.map(\.running), [false, true])
         XCTAssertEqual(Engine.state(items[0]), .available)
+        XCTAssertEqual(Engine.state(items[1]), .upToDate)
         XCTAssertTrue(items[0].canUpdate)
+        // dpkg orders apt versions (the probe lists a candidate only when it is newer), epochs and all.
+        var epoch = items[0]; epoch.installed = "9.0.0-1"; epoch.latest = LatestInfo(version: "1:2.0.0-1")
+        XCTAssertEqual(Engine.state(epoch), .available)
         XCTAssertEqual(items[0].command, "sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y 'claude-desktop'")
         let asks = Engine.buildItems(Probe.parse(out.replacingOccurrences(of: "SUDO\t1\n", with: "")), machine: Machine(id: "rog", name: "rog"),
                                      catalog: Catalog.bundled())
@@ -81,6 +89,38 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(claude?.method, .winget("Anthropic.Claude"))
         XCTAssertEqual(Engine.state(claude!), .available)
         XCTAssertEqual(items.first { $0.defID == "cursor" }?.method, .winget("Anysphere.Cursor"))
+
+        // Codex and ChatGPT side by side: both are listed, each under its own key.
+        let both = [WingetRow(name: "Codex", id: "OpenAI.Codex", version: "1.0", available: "1.1"),
+                    WingetRow(name: "ChatGPT", id: "OpenAI.ChatGPT", version: "2.0", available: "")]
+        let openai = Engine.buildItems(ProbeResult(os: .windows, winget: both), machine: .local, catalog: Catalog.bundled())
+        XCTAssertEqual(openai.map(\.key), ["local/codex-app:Codex", "local/codex-app:ChatGPT"])
+        // winget in another language is reported rather than silently showing nothing.
+        XCTAssertTrue(Probe.parse("OS\tWindows\tAMD64\nWL\tNom     ID     Version     Disponible\n").wingetUnreadable)
+        XCTAssertFalse(Probe.parse("OS\tWindows\tAMD64\nWL\t" + lines[1] + "\n").wingetUnreadable)
+    }
+
+    /// An app that comes in several variants keeps one key whether or not the others are installed,
+    /// and what was saved under the old key moves with it.
+    func testVariantKeysAreStable() {
+        let one = "OS\tDarwin\tarm64\nAPP\tcodex-app\tChatGPT\t/Applications/ChatGPT.app\t26.1\tcom.openai.chat\t0\n"
+        let alone = Engine.buildItems(Probe.parse(one), machine: .local, catalog: Catalog.bundled())
+        let two = Engine.buildItems(Probe.parse(one + "APP\tcodex-app\tCodex\t/Applications/Codex.app\t26.1\tcom.openai.codex\t0\n"),
+                                    machine: .local, catalog: Catalog.bundled())
+        XCTAssertEqual(alone.map(\.key), ["local/codex-app:ChatGPT"])
+        XCTAssertEqual(two.map(\.key), ["local/codex-app:ChatGPT", "local/codex-app:Codex"])
+
+        let d = UserDefaults.standard
+        let keys = ["previousVersions", "excludedFromUpdateAll", "hiddenTools", "heldBackByRollback"]
+        let saved = keys.map { d.object(forKey: $0) }
+        defer { for (k, v) in zip(keys, saved) { d.set(v, forKey: k) } }
+        for k in keys { d.removeObject(forKey: k) }
+        d.set(["local/codex-app", "local/cursor"], forKey: "excludedFromUpdateAll")
+        d.set(["local/codex-app": "26.0"], forKey: "previousVersions")
+        XCTAssertTrue(History.migrateVariantKeys(alone))
+        XCTAssertEqual(History.excluded, ["local/codex-app:ChatGPT", "local/cursor"])
+        XCTAssertEqual(History.previous, ["local/codex-app:ChatGPT": "26.0"])
+        XCTAssertFalse(History.migrateVariantKeys(two), "with two installed, the old key can't be told apart, and nothing is left under it")
     }
 
     func testElectronYml() {
@@ -136,6 +176,7 @@ final class UpdatePlsTests: XCTestCase {
             Engine.macCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app)),
             Engine.macKeepCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app), keep: 3),
             Engine.macRecoverScript(marker: Engine.swapMarkerPath(app)),
+            Probe.unixScript(Catalog.bundled()),
             Probe.debFunctions + "up_deb_running chatgpt || true\n",
         ] {
             let p = Process()
@@ -300,11 +341,16 @@ final class UpdatePlsTests: XCTestCase {
         let saved = ItemLock.dir
         ItemLock.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-locks-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: ItemLock.dir); ItemLock.dir = saved }
-        let a = try XCTUnwrap(ItemLock.take("local/cursor"))
-        XCTAssertNil(ItemLock.take("local/cursor"), "a second update of the same tool must wait")
-        XCTAssertNotNil(ItemLock.take("local/antigravity"), "other tools aren't blocked")
+        let a = try ItemLock.take("local/cursor").get()
+        guard case .failure(.busy) = ItemLock.take("local/cursor") else { return XCTFail("a second update of the same tool must wait") }
+        XCTAssertNotNil(try? ItemLock.take("local/antigravity").get(), "other tools aren't blocked")
         a.release()
-        XCTAssertNotNil(ItemLock.take("local/cursor"))
+        XCTAssertNotNil(try? ItemLock.take("local/cursor").get())
+        // A lock that can't be made stops the update rather than letting it run unlocked.
+        let dir = ItemLock.dir
+        ItemLock.dir = URL(fileURLWithPath: "/dev/null/locks")
+        defer { ItemLock.dir = dir }
+        guard case .failure(.failed) = ItemLock.take("local/cursor") else { return XCTFail("must fail closed") }
     }
 
     /// A swap cut off between its two moves leaves the app missing; it is put back before anything else.
@@ -326,7 +372,7 @@ final class UpdatePlsTests: XCTestCase {
         ItemLock.dir = sandbox.home.appendingPathComponent("Locks")
         defer { ItemLock.dir = savedLocks }
         try interrupt()
-        let held = try XCTUnwrap(ItemLock.take(item.key))
+        let held = try ItemLock.take(item.key).get()
         var restored = await Engine.recoverInterruptedSwaps(home: sandbox.home, run: sandbox.runner)
         XCTAssertEqual(restored, [])
         XCTAssertNil(sandbox.version(sandbox.app))
@@ -345,7 +391,125 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(o.ok, o.message + "\n" + o.output)
         XCTAssertEqual(o.previous, "1.0")
         XCTAssertEqual(sandbox.version(sandbox.app), "2.0")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.home.appendingPathComponent(Engine.swapMarkerPath(item)).path))
+        let marker = sandbox.home.appendingPathComponent(Engine.swapMarkerPath(item))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+
+        // Cut off while copying to another volume: the app is there but incomplete, so the complete copy goes back.
+        try "\(sandbox.app.path)\n\(kept.path)\n\(item.key)\n".write(to: marker, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: sandbox.app.appendingPathComponent("Contents/MacOS/T"))
+        restored = await Engine.recoverInterruptedSwaps(home: sandbox.home, run: sandbox.runner)
+        XCTAssertEqual(restored, [sandbox.app.path])
+        XCTAssertEqual(sandbox.version(sandbox.app), "1.0")
+
+        // If it can't be put back, the marker stays and the next start tries again.
+        try interrupt()
+        let apps = sandbox.app.deletingLastPathComponent().path
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: apps)
+        restored = await Engine.recoverInterruptedSwaps(home: sandbox.home, run: sandbox.runner)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: apps)
+        XCTAssertEqual(restored, [])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        restored = await Engine.recoverInterruptedSwaps(home: sandbox.home, run: sandbox.runner)
+        XCTAssertEqual(restored, [sandbox.app.path])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// Variants of one app (T3 Code and its Nightly) share a backup folder: each prunes and replaces only its own copies.
+    func testVariantsKeepTheirOwnBackups() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1")
+        var item = sandbox.item(installed: "1")
+        let saved = sandbox.home.appendingPathComponent(Engine.savedPath(item))
+        // The other variant's copies, one of them of the version about to be installed.
+        for v in ["2", "0.5", "0.6"] { try sandbox.makeApp(at: saved.appendingPathComponent("\(v)/B.app"), version: v) }
+        let zip = try sandbox.zippedApp(version: "2")
+        item.latest = LatestInfo(version: "2", url: zip.absoluteString)
+        let o = await Engine.installMacApp(item, version: "2", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, keep: 1, run: sandbox.runner)
+        XCTAssertTrue(o.ok, o.message + "\n" + o.output)
+        for v in ["2", "0.5", "0.6"] { XCTAssertNotNil(sandbox.version(saved.appendingPathComponent("\(v)/B.app")), "B \(v) is kept") }
+        XCTAssertEqual(sandbox.version(saved.appendingPathComponent("1/T.app")), "1")
+    }
+
+    /// An app's own updater that never finishes stops the update instead of having the app swapped under it.
+    func testWaitingForTheAppsOwnUpdaterHasADeadline() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1")
+        let shipIt = Process()
+        shipIt.executableURL = URL(fileURLWithPath: "/bin/bash")
+        shipIt.arguments = ["-c", "exec -a \(Shell.q("ShipIt \(sandbox.app.path)/x")) sleep 30"]
+        try shipIt.run()
+        defer { shipIt.terminate() }
+        try await Task.sleep(for: .milliseconds(200))
+        let r = await sandbox.runner(Engine.macWaitUpdaterScript(app: sandbox.app.path, bundleID: "com.example.t", name: "T", seconds: 2), 60, nil)
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(Engine.failure(r), "T is still installing its own update. Let it finish, then press Retry.")
+    }
+
+    /// An open app is only quit once a copy of it is kept for rollback.
+    func testMacAppUpdateStopsIfItCantKeepACopy() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        var item = sandbox.item(installed: "1.0")
+        item.latest = LatestInfo(version: "2.0", url: zip.absoluteString)
+        let scripts = Box<[String]>([])
+        let runner: Engine.ScriptRunner = { script, timeout, out in
+            scripts.mutate { $0.append(script) }
+            if script.contains("CLONED") { return await sandbox.runner("echo 'UPFAIL No space left on device' >&2; exit 1", timeout, out) }
+            var res = await sandbox.runner(script, timeout, out)
+            if script.contains("Downloading") { res.stdout = res.stdout.replacingOccurrences(of: "RUNNING\t0", with: "RUNNING\t1") }
+            return res
+        }
+        let o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, run: runner)
+        XCTAssertFalse(o.ok)
+        XCTAssertEqual(o.message, "Couldn't keep a copy of T for rollback, so it wasn't quit or updated: No space left on device")
+        XCTAssertFalse(scripts.value.contains { $0.contains("updater_running()") || $0.contains("Installing T") }, "never quit or swapped")
+        XCTAssertEqual(sandbox.version(sandbox.app), "1.0")
+    }
+
+    /// A feed that points at an older build than the installed one never downgrades the app.
+    func testMacAppUpdateRefusesADownloadOlderThanInstalled() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "3.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        var item = sandbox.item(installed: "3.0")
+        item.latest = LatestInfo(version: "4.0", url: zip.absoluteString)
+        let o = await Engine.installMacApp(item, version: "4.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, run: sandbox.runner)
+        XCTAssertFalse(o.ok)
+        XCTAssertEqual(o.message, "The download is T 2.0, not 4.0; nothing was installed")
+        XCTAssertEqual(sandbox.version(sandbox.app), "3.0")
+    }
+
+    /// A dry run never runs a package manager: only a direct download can be checked without installing.
+    func testDryRunInstallsNothing() async throws {
+        let dir = ItemLock.dir
+        ItemLock.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-locks-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: ItemLock.dir); ItemLock.dir = dir }
+        let item = Item(machine: .local, os: .mac, defID: "x", name: "X", brand: "X", isApp: false, path: "/x",
+                        installed: "1.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "nonexistent-update-pls-test"))
+        let o = await Engine.update(item, relaunch: false, reporter: Reporter(), dryRun: true)
+        XCTAssertTrue(o.ok)
+        XCTAssertFalse(o.changed)
+        XCTAssertEqual(o.message, "Would run: bun add -g 'nonexistent-update-pls-test@latest' (dry run, nothing installed)")
+    }
+
+    /// A finished job only counts once its machine shows the new version.
+    func testJobsAreConfirmedByTheirInstalledVersion() {
+        var item = Item(machine: .local, os: .mac, defID: "x", name: "X", brand: "X", isApp: false, path: "/x",
+                        installed: "1.0", latest: LatestInfo(version: "3.0"), method: .bun(package: "x"))
+        item.state = .available
+        let ok = UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
+        func fresh(_ v: String) -> Item { var f = item; f.installed = v; f.state = Engine.state(f); return f }
+        XCTAssertEqual(Engine.confirm(item, switchedTo: nil, ok, fresh: fresh("3.0"), offline: false).message, "Updated to 3.0")
+        XCTAssertEqual(Engine.confirm(item, switchedTo: nil, ok, fresh: fresh("2.0"), offline: false).message, "Updated to 2.0, not 3.0")
+        XCTAssertFalse(Engine.confirm(item, switchedTo: nil, ok, fresh: fresh("1.0"), offline: false).ok)
+        XCTAssertFalse(Engine.confirm(item, switchedTo: "0.9", ok, fresh: fresh("1.0"), offline: false).ok)
+        XCTAssertEqual(Engine.confirm(item, switchedTo: "0.9", ok, fresh: fresh("0.9"), offline: false).message, "Rolled back to 0.9")
+        XCTAssertEqual(Engine.confirm(item, switchedTo: nil, ok, fresh: nil, offline: true).message,
+                       "Updated (machine went offline before it could be re-checked)")
     }
 
     func testStagingNeedsFreeSpace() async throws {
@@ -592,6 +756,9 @@ final class UpdatePlsTests: XCTestCase {
         let saved = Log.dir
         Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let previous = UserDefaults.standard.object(forKey: "previousVersions")
+        defer { UserDefaults.standard.set(previous, forKey: "previousVersions") }
+        UserDefaults.standard.removeObject(forKey: "previousVersions")
         let model = AppModel(autostart: false)
         var a = Item(machine: .local, os: .mac, defID: "a", name: "A", brand: "A", isApp: false, path: "/a",
                      installed: "1.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "a"))
@@ -606,10 +773,9 @@ final class UpdatePlsTests: XCTestCase {
             return UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
         }
         // A updates for real; B claims success but is still on the old version afterwards.
-        model.rescan = { m, _ in
-            var a2 = a; a2.installed = "2.0"; a2.state = .upToDate
-            return (MachineStatus(machine: m, os: .mac, state: .online), [a2, b])
-        }
+        var a2 = a; a2.installed = "2.0"; a2.state = .upToDate
+        let found = [a2, b]
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), m.isLocal ? found : []) }
         model.enqueue([(a, .update), (b, .update)])
         model.enqueue([(a, .update)])
         model.updateAll()
@@ -623,6 +789,7 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(model.activity[a.key], .done("Updated to 2.0"))
         XCTAssertEqual(model.activity[b.key], .failed("Still on 1.0 after updating. Updated"))
         XCTAssertEqual(model.previous[a.key], "1.0")
+        XCTAssertNil(model.previous[b.key], "an update that didn't take isn't recorded")
         XCTAssertNotNil(model.runFiles[a.key])
 
         // Results survive the next background check; the failure only clears once the tool is current.
@@ -662,6 +829,7 @@ final class UpdatePlsTests: XCTestCase {
                 let line: String = switch a {
                 case .queued: "queued"
                 case let .running(text, f): f.map { "\(text) \(Int($0 * 10) * 10)%" } ?? text
+                case let .checking(m): "checking: \(m)"
                 case let .done(m): "DONE \(m)"
                 case let .failed(m): "FAILED \(m)"
                 }
@@ -718,6 +886,46 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertNil(History.record(a, UpdateOutcome(ok: true, message: "Updated")))
         XCTAssertEqual(History.excluded, ["local/a", "local/b"])
         XCTAssertNil(History.record(a, switchedTo: "1.0", .fail("nope")))
+
+        // With the latest unknown (lookup failed), a switch holds the tool, and never lifts a hold.
+        var c = a; c.defID = "c"; c.latest = nil
+        XCTAssertEqual(History.record(c, switchedTo: "1.0", ok), .added)
+        XCTAssertNil(History.record(c, switchedTo: "0.9", ok))
+        XCTAssertTrue(History.excluded.contains("local/c"))
+    }
+
+    /// Retry repeats the job that failed (here a rollback), and disabled machines are left out of Update all.
+    @MainActor
+    func testRetryRepeatsTheFailedJob() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let model = AppModel(autostart: false)
+        var a = Item(machine: .local, os: .mac, defID: "a", name: "A", brand: "A", isApp: false, path: "/a",
+                     installed: "2.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "a"))
+        a.state = .upToDate
+        model.items = [a]
+        let jobs = Box<[AppModel.Job]>([])
+        model.perform = { _, job, _ in jobs.mutate { $0.append(job) }; return .fail("network down") }
+        let found = [a]
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), found) }
+        model.enqueue([(a, .install("1.0", .published))])
+        for _ in 0..<50 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(model.activity[a.key], .failed("network down"))
+        XCTAssertTrue(model.canRetry(a), "a failed rollback can be retried even though there's no update")
+        model.retry(a)
+        for _ in 0..<50 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(jobs.value, [.install("1.0", .published), .install("1.0", .published)])
+
+        let host = Machine(id: "elsewhere", name: "elsewhere")
+        var remote = a; remote.machine = host; remote.latest = LatestInfo(version: "3.0"); remote.state = .available
+        model.hosts = [host.id]
+        model.disabledHosts = []
+        defer { model.disabledHosts = [] }
+        model.items = [remote]
+        XCTAssertEqual(model.pendingUpdates.map(\.key), ["elsewhere/a"])
+        model.disabledHosts = [host.id]
+        XCTAssertTrue(model.pendingUpdates.isEmpty)
     }
 
     func testChangedPart() {

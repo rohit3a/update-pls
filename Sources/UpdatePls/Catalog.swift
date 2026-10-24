@@ -100,9 +100,11 @@ enum Version {
         return String(text[r])
     }
 
-    /// Cask versions look like "3.25.9,5d4df96…"; keep the human part.
+    /// Cask versions look like "3.25.9,5d4df96…"; keep the human part. SemVer build metadata ("+build.7")
+    /// doesn't order versions, so it goes too.
     static func clean(_ v: String) -> String {
         var s = v.split(separator: ",").first.map(String.init) ?? v
+        if let plus = s.firstIndex(of: "+") { s = String(s[..<plus]) }
         if s.hasPrefix("v") { s.removeFirst() }
         if s.hasPrefix("rust-v") { s.removeFirst(6) }
         return s
@@ -124,7 +126,7 @@ enum Version {
         func split(_ v: String) -> ([Int], [String]) {
             // Never index blindly: an app caught mid-install can report "" or "-" as its version.
             let parts = v.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-            let core = (parts.first ?? "").split(separator: ".").map { Int($0) ?? 0 }
+            let core = (parts.first ?? "").split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
             let pre = parts.count > 1 ? parts[1].split(separator: ".").map(String.init) : []
             return (core, pre)
         }

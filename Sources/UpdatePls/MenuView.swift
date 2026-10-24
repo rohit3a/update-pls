@@ -40,7 +40,7 @@ struct MenuView: View {
             // Pressing it again only adds what isn't already queued, so nothing is ever installed twice.
             if !model.isBusy || !model.updatable.isEmpty {
                 Button("Update all (\(model.updatable.count))") { model.updateAll() }
-                    .disabled(model.updatable.isEmpty)
+                    .disabled(model.updatable.isEmpty || model.selfUpdating)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: model.isBusy)
@@ -189,6 +189,8 @@ struct ItemRow: View {
             Text(fraction.map { "\(phase) · \(Int($0 * 100))%" } ?? (phase.hasSuffix(".") ? phase : "\(phase)…"))
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
                 .contentTransition(.opacity)
+        case let .checking(msg)?:
+            Text("\(msg) · checking…").font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
         case let .done(msg)?:
             Text(msg).font(.caption).foregroundStyle(.green).lineLimit(2)
         case let .failed(msg)?:
@@ -278,13 +280,15 @@ struct ItemRow: View {
             } else {
                 ProgressView().controlSize(.small)
             }
+        case .checking?:
+            ProgressView().controlSize(.small).help("Checking the new version")
         case .failed?:
             HStack(spacing: 6) {
                 if let runFile {
                     Button { NSWorkspace.shared.open(runFile) } label: { Image(systemName: "doc.text.magnifyingglass") }
                         .buttonStyle(.borderless).help("Show what happened")
                 }
-                if item.canUpdate { Button("Retry") { model.update(item) }.controlSize(.small) }
+                if model.canRetry(item) { Button("Retry") { model.retry(item) }.controlSize(.small) }
             }
         case .done? where !(item.state == .available && item.canUpdate):
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).help("Updated")
@@ -302,7 +306,7 @@ struct ItemRow: View {
                 Button("Copy sudo command") { copy(cmd) }.help(cmd)
             } else if item.state == .available && item.canUpdate {
                 Button(item.running ? "Update & Relaunch" : "Update") { model.update(item) }
-                    .buttonStyle(.borderedProminent).controlSize(.small)
+                    .buttonStyle(.borderedProminent).controlSize(.small).disabled(model.selfUpdating)
             } else if item.state == .available {
                 Text("Update manually").font(.caption).foregroundStyle(.secondary)
             } else {

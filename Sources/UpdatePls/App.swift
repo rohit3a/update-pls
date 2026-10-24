@@ -103,12 +103,37 @@ enum CLI {
 
     static func checkAll(_ machines: [Machine]) async -> [(MachineStatus, [Item])] {
         let catalog = Catalog.load(), resolver = LatestResolver()
-        return await withTaskGroup(of: (MachineStatus, [Item]).self) { g in
+        let out = await withTaskGroup(of: (MachineStatus, [Item]).self) { g in
             for m in machines { g.addTask { await Engine.check(m, catalog: catalog, resolver: resolver) } }
             var out: [(MachineStatus, [Item])] = []
             for await r in g { out.append(r) }
             return out.sorted { $0.0.machine.id < $1.0.machine.id }
         }
+        History.migrateVariantKeys(out.flatMap(\.1))
+        return out
+    }
+
+    /// Reads the machines of finished jobs again and confirms each by its installed version, as the menu does;
+    /// only then is it recorded. Returns false if any didn't take.
+    static func confirm(_ done: [(item: Item, version: String?, outcome: UpdateOutcome)]) async -> Bool {
+        let finished = done.filter(\.outcome.ok)
+        guard !finished.isEmpty else { return true }
+        print("== Checking the new versions")
+        let again = await checkAll(Array(Set(finished.map(\.item.machine))))
+        var allOK = true
+        for (i, version, o) in finished {
+            let scan = again.first { $0.0.machine == i.machine }
+            let offline = if case .offline? = scan?.0.state { true } else { false }
+            let (ok, message) = Engine.confirm(i, switchedTo: version, o, fresh: scan?.1.first { $0.key == i.key }, offline: offline)
+            print("   \(ok ? "OK" : "FAILED") \(i.key): \(message)")
+            if !ok { allOK = false; Log.error("verify \(i.key): \(message)"); continue }
+            switch History.record(i, switchedTo: version, o) {
+            case .added: print("   (skipped in Update all so it stays on \(version ?? ""))")
+            case .lifted: print("   (back in Update all)")
+            case nil: break
+            }
+        }
+        return allOK
     }
 
     static func main(_ args: [String]) async -> Int32 {
@@ -146,6 +171,7 @@ enum CLI {
         }
         if items.isEmpty { print("Nothing to update"); return 0 }
         var code: Int32 = 0
+        var done: [(item: Item, version: String?, outcome: UpdateOutcome)] = []
         // One machine at a time here keeps the terminal output readable.
         for i in items {
             print("== \(i.machine.id)/\(i.defID): \(i.installed ?? "?") -> \(i.latest?.version ?? "latest")")
@@ -156,11 +182,12 @@ enum CLI {
             }
             let o = await Engine.update(i, relaunch: true, reporter: r, dryRun: dryRun)
             Log.appendRun(file, "\n\(Log.stamp()) \(o.ok ? "Done" : "FAILED"): \(o.message)\n")
-            if !dryRun, History.record(i, o) == .lifted { print("   (back in Update all)") }
-            print(o.ok ? "   OK: \(o.message)" : "   FAILED: \(o.message)")
+            print(o.ok ? "   finished: \(o.message)" : "   FAILED: \(o.message)")
             print("   output: \(file.path)")
             if !o.ok { code = 1 }
+            if !dryRun { done.append((i, nil, o)) }
         }
+        if await !confirm(done) { code = 1 }
         return code
     }
 
@@ -189,13 +216,9 @@ enum CLI {
         let r = Reporter(runFile: file) { text, fraction in print("   \(text)\(fraction.map { " \(Int($0 * 100))%" } ?? "")") }
         let o = await Engine.install(item, version: version, from: source, relaunch: true, reporter: r)
         Log.appendRun(file, "\n\(Log.stamp()) \(o.ok ? "Done" : "FAILED"): \(o.message)\n")
-        switch History.record(item, switchedTo: version, o) {
-        case .added: print("   (skipped in Update all so it stays on \(version))")
-        case .lifted: print("   (back in Update all)")
-        case nil: break
-        }
-        print(o.ok ? "   OK: \(o.message)" : "   FAILED: \(o.message)")
+        print(o.ok ? "   finished: \(o.message)" : "   FAILED: \(o.message)")
         print("   output: \(file.path)")
-        return o.ok ? 0 : 1
+        guard o.ok else { return 1 }
+        return await confirm([(item, version, o)]) ? 0 : 1
     }
 }

@@ -15,7 +15,7 @@
     { "id": "cline", "name": "Cline CLI", "brand": "Cline", "binaries": ["cline"], "npm": ["cline"], "latest": { "npm": "cline" } },
     { "id": "auggie", "name": "Auggie", "brand": "Augment", "binaries": ["auggie"], "npm": ["@augmentcode/auggie"], "latest": { "npm": "@augmentcode/auggie" } },
     { "id": "goose", "name": "Goose", "brand": "Goose", "binaries": ["goose"], "selfUpdate": "update", "latest": { "github": "block/goose" } },
-    { "id": "agy", "name": "Antigravity CLI", "brand": "Google", "binaries": ["agy"] },
+    { "id": "agy", "name": "Antigravity CLI", "brand": "Google", "binaries": ["agy"], "selfUpdate": "update", "latest": { "scrape": { "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/", "regex": "Stable Version: ([0-9]+(?:\\.[0-9]+)*)" } } },
     { "id": "aider", "name": "Aider", "brand": "Aider", "binaries": ["aider"], "pypi": "aider-chat", "latest": { "pypi": "aider-chat" } }
   ],
   "apps": [

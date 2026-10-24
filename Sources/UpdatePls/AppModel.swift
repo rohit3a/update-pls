@@ -9,11 +9,13 @@ final class AppModel: ObservableObject {
     enum Activity: Hashable {
         case queued
         case running(String, Double?)
+        /// Finished, waiting for its machine to be read again to confirm it (the job's own message).
+        case checking(String)
         case done(String)
         case failed(String)
 
         var isActive: Bool {
-            switch self { case .queued, .running: true; default: false }
+            switch self { case .queued, .running, .checking: true; default: false }
         }
     }
 
@@ -65,8 +67,8 @@ final class AppModel: ObservableObject {
         case let .install(v, source): await Engine.install(item, version: v, from: source, relaunch: true, reporter: r)
         }
     }
-    var rescan: (Machine, [String: LatestInfo]) async -> (MachineStatus, [Item]) = { m, known in
-        await Engine.check(m, catalog: Catalog.load(), resolver: LatestResolver(), known: known)
+    var scan: @Sendable (Machine, Catalog, LatestResolver, [String: LatestInfo]) async -> (MachineStatus, [Item]) = { m, c, r, known in
+        await Engine.check(m, catalog: c, resolver: r, known: known)
     }
 
     private var scheduler: NSBackgroundActivityScheduler?
@@ -81,8 +83,10 @@ final class AppModel: ObservableObject {
     }
     private var awake: NSObjectProtocol?
     var keepsAwake: Bool { awake != nil }
-    /// Finished jobs whose machine hasn't been re-checked yet: shown as done, but can't be started again.
-    private var unverified: Set<String> = []
+    /// Machines being scanned by a check. Their queued jobs wait for it: a scan could catch an app mid-swap.
+    private var scanning: Set<Machine> = []
+    /// Each tool's last job, so Retry repeats a failed rollback rather than updating.
+    private var lastJob: [String: Job] = [:]
     private var batch: [(name: String, ok: Bool, message: String)] = []
     /// Notifications only work from the app bundle (they crash a bare binary or the test runner).
     private let canNotify = Bundle.main.bundleURL.pathExtension == "app"
@@ -119,7 +123,8 @@ final class AppModel: ObservableObject {
 
     /// Updates waiting: shown on the icon and in Update all.
     var pendingUpdates: [Item] {
-        items.filter { $0.state == .available && $0.canUpdate && !excluded.contains($0.key) && !hidden.contains($0.key) }
+        let on = Set(machines)
+        return items.filter { on.contains($0.machine) && $0.state == .available && $0.canUpdate && !excluded.contains($0.key) && !hidden.contains($0.key) }
     }
 
     /// What Update all would start now (leaves out anything already queued or running).
@@ -127,7 +132,7 @@ final class AppModel: ObservableObject {
 
     var isBusy: Bool { !workers.isEmpty || activity.values.contains(where: \.isActive) }
     var activeCount: Int { activity.values.filter(\.isActive).count }
-    func isActive(_ item: Item) -> Bool { (activity[item.key]?.isActive ?? false) || unverified.contains(item.key) }
+    func isActive(_ item: Item) -> Bool { activity[item.key]?.isActive ?? false }
 
     /// "Cursor on rog-workstation" for a hidden tool's key, for Settings.
     func label(forKey key: String) -> String {
@@ -187,6 +192,8 @@ final class AppModel: ObservableObject {
         let catalog = Catalog.load()
         let resolver = LatestResolver()
         let machines = machines
+        let scan = scan
+        scanning = Set(machines)
         async let selfLatest = SelfUpdate.latest()
         statuses = machines.map { m in
             var s = statuses.first { $0.machine == m } ?? MachineStatus(machine: m)
@@ -195,11 +202,20 @@ final class AppModel: ObservableObject {
         }
         await withTaskGroup(of: (MachineStatus, [Item]).self) { group in
             for m in machines {
-                group.addTask { await Engine.check(m, catalog: catalog, resolver: resolver) }
+                group.addTask { await scan(m, catalog, resolver, [:]) }
             }
-            for await (status, found) in group { apply(status, found) }
+            for await (status, found) in group {
+                apply(status, found)
+                scanning.remove(status.machine)
+            }
         }
+        scanning = []
         items.removeAll { item in !machines.contains(item.machine) }
+        if History.migrateVariantKeys(items) {
+            previous = History.previous
+            excluded = History.excluded
+            hidden = Set(UserDefaults.standard.stringArray(forKey: "hiddenTools") ?? [])
+        }
         self.selfLatest = await selfLatest ?? self.selfLatest
         // A failure stays until the tool is retried or turns out to be up to date; "Updated" until the next check you ask for.
         for (key, a) in activity {
@@ -273,8 +289,21 @@ final class AppModel: ObservableObject {
 
     func dismiss(_ item: Item) { if !isActive(item) { activity[item.key] = nil } }
 
+    /// Runs a failed job again: the same update, or the same switch to another version (already confirmed once).
+    func retry(_ item: Item) {
+        guard let job = lastJob[item.key], case .install = job else { return update(item) }
+        enqueue([(item, job)])
+    }
+
+    func canRetry(_ item: Item) -> Bool {
+        if case .install? = lastJob[item.key] { return true }
+        return item.canUpdate
+    }
+
     /// Queues jobs. Anything already queued or running is ignored, so pressing a button again does nothing.
     func enqueue(_ jobs: [(Item, Job)]) {
+        // Update pls is about to quit and replace itself.
+        guard !selfUpdating else { return }
         var seen = Set<String>()
         let fresh = jobs.filter { !isActive($0.0) && seen.insert($0.0.key).inserted }
         guard !fresh.isEmpty else { return }
@@ -290,6 +319,7 @@ final class AppModel: ObservableObject {
     }
 
     private func drain(_ m: Machine) async {
+        while scanning.contains(m) { try? await Task.sleep(for: .milliseconds(200)) }
         while let first = pending[m]?.first {
             var done: [(Item, Job, UpdateOutcome)] = []
             var next: (Item, Job)? = first
@@ -308,6 +338,7 @@ final class AppModel: ObservableObject {
     private func run(_ item: Item, _ job: Job) async -> UpdateOutcome {
         let key = item.key
         activity[key] = .running("Starting", nil)
+        lastJob[key] = job
         let what = if case let .install(v, source) = job { "switch to \(v) (\(source == .saved ? "saved copy" : "published"))" } else { "update \(item.summary)" }
         let file = Log.newRun(key)
         runFiles[key] = file
@@ -320,56 +351,30 @@ final class AppModel: ObservableObject {
         }
         let outcome = await perform(item, job, reporter)
         Log.appendRun(file, "\n\(Log.stamp()) \(outcome.ok ? "Done" : "FAILED"): \(outcome.message)\n")
-        if outcome.ok {
-            let version: String? = if case let .install(v, _) = job { v } else { nil }
-            if let hold = History.record(item, switchedTo: version, outcome) {
-                Log.info("\(key): \(hold == .added ? "held back from Update all" : "back in Update all")")
-            }
-            previous = History.previous
-            excluded = History.excluded
-            activity[key] = .done(outcome.message)
-            unverified.insert(key)
-        } else {
-            activity[key] = .failed(outcome.message)
-        }
+        activity[key] = outcome.ok ? .checking(outcome.message) : .failed(outcome.message)
         return outcome
     }
 
-    /// Re-reads the machine once its queue is empty and confirms each update by its installed version.
+    /// Re-reads the machine once its queue is empty and confirms each job by its installed version. Only then
+    /// is it shown as done and recorded (the version kept for rollback, a hold on Update all).
     private func verify(_ m: Machine, _ done: [(Item, Job, UpdateOutcome)]) async {
         let known = Dictionary(items.filter { $0.machine == m }.compactMap { i in i.latest.map { (i.key, $0) } }, uniquingKeysWith: { a, _ in a })
-        let (status, found) = await rescan(m, known)
+        let (status, found) = await scan(m, Catalog.load(), LatestResolver(), known)
         apply(status, found)
         let offline = if case .offline = status.state { true } else { false }
         for (item, job, o) in done {
             let key = item.key
-            unverified.remove(key)
-            if !o.ok { batch.append((item.name, false, o.message)); continue }
-            let fresh = found.first { $0.key == key }
-            var result: Activity = .done(o.message)
-            if offline || fresh == nil {
-                result = .done(o.message + (offline ? " (machine went offline before it could be re-checked)" : ""))
-            } else if let fresh, let now = fresh.installed {
-                switch job {
-                case .update where !o.changed:
-                    result = .done(o.message)
-                case .update where fresh.state == .available && now == item.installed:
-                    result = .failed("Still on \(now) after updating. \(o.message)")
-                case .update:
-                    result = .done(o.message == "Updated" && now != item.installed ? "Updated to \(now)" : o.message)
-                case let .install(v, _):
-                    let verb = Version.isNewer(item.installed ?? "", than: v) ? "Rolled back to" : "Switched to"
-                    result = now == v ? .done("\(verb) \(v)") : .failed("Still on \(now) after switching to \(v). \(o.message)")
-                }
+            let version: String? = if case let .install(v, _) = job { v } else { nil }
+            let (ok, message) = Engine.confirm(item, switchedTo: version, o, fresh: found.first { $0.key == key }, offline: offline)
+            if ok, let hold = History.record(item, switchedTo: version, o) {
+                Log.info("\(key): \(hold == .added ? "held back from Update all" : "back in Update all")")
             }
-            activity[key] = result
-            if case let .failed(msg) = result {
-                Log.error("verify \(key): \(msg)")
-                batch.append((item.name, false, msg))
-            } else if case let .done(msg) = result {
-                batch.append((item.name, true, msg))
-            }
+            if o.ok && !ok { Log.error("verify \(key): \(message)") }
+            activity[key] = ok ? .done(message) : .failed(message)
+            batch.append((item.name, ok, message))
         }
+        previous = History.previous
+        excluded = History.excluded
     }
 
     private func finishBatch() {

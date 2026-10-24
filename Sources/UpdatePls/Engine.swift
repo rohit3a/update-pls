@@ -52,7 +52,8 @@ struct Item: Identifiable, Hashable {
     var state: ItemState = .unknown
     /// From the catalog: how to install one exact version through the tool's own installer.
     var installVersion: String?
-    /// Set when two variants of one app (T3 Code and T3 Code Nightly) are installed side by side.
+    /// Which app, for apps that come in several (T3 Code and T3 Code Nightly), so each keeps its own key
+    /// whatever else is installed.
     var variant: String?
     /// Versions of this Mac app that Update pls saved on its machine when it replaced them, newest first.
     var saved: [String] = []
@@ -165,6 +166,8 @@ enum Engine {
         }
         status.state = .online
         let probe = Probe.parse(out.stdout)
+        for line in probe.recovery { Log.error("check \(m.id): interrupted update: \(line)") }
+        if probe.wingetUnreadable { Log.error("check \(m.id): couldn't read winget's list (it may not be in English), so its apps aren't shown") }
         var items = buildItems(probe, machine: m, catalog: catalog)
         await withTaskGroup(of: (Int, LatestInfo?).self) { group in
             for (i, item) in items.enumerated() where item.latest == nil {
@@ -182,6 +185,8 @@ enum Engine {
     static func state(_ item: Item) -> ItemState {
         guard let latest = item.latest?.version, let installed = item.installed,
               !Version.clean(latest).isEmpty, !Version.clean(installed).isEmpty else { return .unknown }
+        // apt's candidate is only listed when dpkg says it is newer (epochs, ~rc and all).
+        if case .deb = item.method { return latest != installed ? .available : .upToDate }
         return Version.isNewer(latest, than: installed) ? .available : .upToDate
     }
 
@@ -193,7 +198,6 @@ enum Engine {
             items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: false, path: r.path,
                               installed: installed, method: cliMethod(r, def: def, os: p.os, installed: installed), installVersion: def.installVersion))
         }
-        let appCounts = Dictionary(grouping: p.apps, by: \.id).mapValues(\.count)
         for r in p.apps {
             guard let def = catalog.apps.first(where: { $0.id == r.id }),
                   let variant = def.mac?.first(where: { $0.app == r.appName }) else { continue }
@@ -203,7 +207,7 @@ enum Engine {
             let saved = Set(p.saved.filter { $0.id == r.id && $0.appName == r.appName }.map(\.version))
             items.append(Item(machine: machine, os: p.os, defID: def.id, name: name, brand: def.brand ?? def.name, isApp: true, path: r.path,
                               installed: r.version, method: method, running: r.running,
-                              variant: (appCounts[r.id] ?? 0) > 1 ? r.appName : nil,
+                              variant: def.mac!.count > 1 ? r.appName : nil,
                               saved: saved.sorted { Version.isNewer($0, than: $1) }))
         }
         for r in p.debs {
@@ -217,17 +221,19 @@ enum Engine {
                               running: r.running))
         }
         for def in catalog.apps {
-            for want in def.windows ?? [] {
+            let wants = def.windows ?? []
+            var seen = Set<String>()
+            for want in wants {
                 guard let row = p.winget.first(where: {
                     $0.name.caseInsensitiveCompare(want) == .orderedSame
                         || $0.id.split(separator: ".").last.map(String.init)?.caseInsensitiveCompare(want.replacingOccurrences(of: " ", with: "")) == .orderedSame
-                }) else { continue }
+                }), seen.insert(row.id).inserted else { continue }
                 let managed = !row.id.contains("\\") && row.id.contains(".")
-                items.append(Item(machine: machine, os: p.os, defID: def.id, name: def.name, brand: def.brand ?? def.name, isApp: true, path: row.id,
+                let name = wants.count == 1 ? def.name : want.hasPrefix(def.name) ? want : "\(def.name) (\(want))"
+                items.append(Item(machine: machine, os: p.os, defID: def.id, name: name, brand: def.brand ?? def.name, isApp: true, path: row.id,
                                   installed: row.version,
                                   latest: managed ? LatestInfo(version: row.available.isEmpty ? row.version : row.available) : nil,
-                                  method: managed ? .winget(row.id) : .none))
-                break
+                                  method: managed ? .winget(row.id) : .none, variant: wants.count > 1 ? want : nil))
             }
         }
         for i in items.indices { items[i].arch = p.arch }

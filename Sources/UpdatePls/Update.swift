@@ -154,8 +154,8 @@ enum History {
             d.set(Array(skip), forKey: "excludedFromUpdateAll")
             d.set(Array(hold), forKey: "heldBackByRollback")
         }
-        if let v = version, let latest = item.latest?.version, Version.isNewer(latest, than: v) {
-            // Update all would otherwise take it straight back to the latest.
+        if let v = version, item.latest.map({ Version.isNewer($0.version, than: v) }) ?? true {
+            // Update all would otherwise take it straight back to the latest (with the latest unknown, stay put too).
             guard !skip.contains(key) else { return nil }
             skip.insert(key)
             hold.insert(key)
@@ -164,6 +164,26 @@ enum History {
         guard hold.remove(key) != nil else { return nil }
         skip.remove(key)
         return .lifted
+    }
+
+    /// Apps that come in several variants are keyed by variant even when only one is installed (earlier builds
+    /// only did once two were). Moves what was saved under the old key; true if anything moved.
+    @discardableResult
+    static func migrateVariantKeys(_ items: [Item]) -> Bool {
+        let renames = Dictionary(grouping: items.filter { $0.variant != nil }, by: { "\($0.machine.id)/\($0.defID)" })
+            .compactMapValues { $0.count == 1 ? $0[0].key : nil }
+        var moved = false
+        for k in ["excludedFromUpdateAll", "hiddenTools", "heldBackByRollback"] {
+            guard let list = d.stringArray(forKey: k), list.contains(where: { renames[$0] != nil }) else { continue }
+            d.set(Array(Set(list.map { renames[$0] ?? $0 })), forKey: k)
+            moved = true
+        }
+        var prev = previous
+        for (old, new) in renames {
+            if let v = prev.removeValue(forKey: old) { prev[new] = prev[new] ?? v; moved = true }
+        }
+        if moved { d.set(prev, forKey: "previousVersions") }
+        return moved
     }
 
     /// Skipping or un-skipping a tool by hand makes it your choice, not a rollback's.
@@ -180,14 +200,20 @@ final class ItemLock {
 
     private init(fd: Int32) { self.fd = fd }
 
-    /// Nil while another update holds it. If the lock file can't be made, the update goes ahead unlocked.
-    static func take(_ key: String) -> ItemLock? {
+    enum Refusal: Error { case busy, failed(String) }
+
+    /// Fails while another update holds it, and if the lock file can't be made: nothing runs unlocked.
+    static func take(_ key: String) -> Result<ItemLock, Refusal> {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let name = key.map { $0.isLetter || $0.isNumber || "-._".contains($0) ? String($0) : "_" }.joined()
         let fd = open(dir.appendingPathComponent(name + ".lock").path, O_CREAT | O_RDWR, 0o644)
-        guard fd >= 0 else { Log.error("lock \(key): \(String(cString: strerror(errno)))"); return ItemLock(fd: -1) }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return nil }
-        return ItemLock(fd: fd)
+        guard fd >= 0 else {
+            let why = String(cString: strerror(errno))
+            Log.error("lock \(key): \(why)")
+            return .failure(.failed(why))
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return .failure(.busy) }
+        return .success(ItemLock(fd: fd))
     }
 
     func release() {
@@ -221,7 +247,8 @@ extension Engine {
 
     /// Runs the update for one item. Desktop apps that are open are quit first and reopened if `relaunch`.
     static func update(_ item: Item, relaunch: Bool, reporter r: Reporter, dryRun: Bool = false) async -> UpdateOutcome {
-        guard let lock = ItemLock.take(item.key) else { return busy(item) }
+        let lock: ItemLock
+        switch ItemLock.take(item.key) { case let .success(l): lock = l; case let .failure(e): return refused(item, e) }
         defer { lock.release() }
         let start = Date()
         Log.info("update \(item.key): \(item.summary)\(dryRun ? " (dry run)" : "")\(r.runFile.map { "\nrun log: \($0.path)" } ?? "")")
@@ -236,6 +263,9 @@ extension Engine {
             } else {
                 outcome = .fail("No download is published for this app")
             }
+        // Only a direct download can be fetched and checked without installing it.
+        case _ where dryRun:
+            outcome = UpdateOutcome(ok: true, message: "Would run: \(item.command ?? "nothing") (dry run, nothing installed)", changed: false)
         case .cask where item.os == .mac: outcome = await updateCask(item, relaunch: relaunch, r)
         default: outcome = await runCommand(item, r)
         }
@@ -243,16 +273,22 @@ extension Engine {
         return outcome
     }
 
-    private static func busy(_ item: Item) -> UpdateOutcome {
-        Log.error("\(item.key): another Update pls is updating it")
-        return .fail("Another Update pls is updating \(item.name) right now")
+    private static func refused(_ item: Item, _ why: ItemLock.Refusal) -> UpdateOutcome {
+        switch why {
+        case .busy:
+            Log.error("\(item.key): another Update pls is updating it")
+            return .fail("Another Update pls is updating \(item.name) right now")
+        case let .failed(e):
+            return .fail("Couldn't lock \(item.name) for updating: \(e)")
+        }
     }
 
     /// Installs one exact version: an older one to roll back, or a newer saved one to go forward again.
     /// Mac apps come from a saved copy (checked: same bundle id, valid signature) or the publisher's release;
     /// other tools reinstall that version with their package manager.
     static func install(_ item: Item, version: String, from source: VersionSource, relaunch: Bool, reporter r: Reporter) async -> UpdateOutcome {
-        guard let lock = ItemLock.take(item.key) else { return busy(item) }
+        let lock: ItemLock
+        switch ItemLock.take(item.key) { case let .success(l): lock = l; case let .failure(e): return refused(item, e) }
         defer { lock.release() }
         let start = Date()
         Log.info("install \(item.key): \(item.installed ?? "?") -> \(version) (\(source == .saved ? "saved copy" : "published"))")
@@ -292,6 +328,28 @@ extension Engine {
         }
     }
 
+    /// Checks a finished job against a fresh scan of its machine, for the menu and the command line.
+    /// `version` is the one switched to (nil for an update); `fresh` is the tool as scanned again, nil if it
+    /// couldn't be read (then the job's own result stands).
+    static func confirm(_ item: Item, switchedTo version: String?, _ o: UpdateOutcome, fresh: Item?, offline: Bool) -> (ok: Bool, message: String) {
+        guard o.ok else { return (false, o.message) }
+        guard !offline, let fresh, let now = fresh.installed else {
+            return (true, o.message + (offline ? " (machine went offline before it could be re-checked)" : ""))
+        }
+        if let v = version {
+            let verb = Version.isNewer(item.installed ?? "", than: v) ? "Rolled back to" : "Switched to"
+            return Version.clean(now) == Version.clean(v) ? (true, "\(verb) \(v)") : (false, "Still on \(now) after switching to \(v). \(o.message)")
+        }
+        if !o.changed { return (true, o.message) }
+        if now == item.installed {
+            return fresh.state == .available ? (false, "Still on \(now) after updating. \(o.message)") : (true, o.message)
+        }
+        let message = o.message == "Updated" ? "Updated to \(now)" : o.message
+        // A tool's own updater can stop short of the latest (another channel, a staged rollout).
+        if fresh.state == .available, let latest = fresh.latest?.version { return (true, "\(message), not \(latest)") }
+        return (true, message)
+    }
+
     /// CLIs and everything that has a single command: npm, brew, pipx, uv, bun, built-in updaters, winget.
     static func runCommand(_ item: Item, _ r: Reporter) async -> UpdateOutcome {
         var item = item
@@ -299,7 +357,9 @@ extension Engine {
             // Install the exact version we found, so nightly users stay on nightly.
             item.method = .npm(bin: bin, prefix: prefix, package: pkg, tag: item.latest?.version ?? "latest", writable: w)
         }
-        guard let cmd = item.command else { return .fail("No way to update this automatically") }
+        var command = item.command
+        if case .bun = item.method, let v = item.latest?.version { command = item.rollbackCommand(to: v) ?? command }
+        guard let cmd = command else { return .fail("No way to update this automatically") }
         guard !item.needsSudo else { return .fail("Needs your password; copy the sudo command instead") }
         r.showLines = true
         r.phase("Updating with \(item.method.label)")
@@ -375,20 +435,27 @@ extension Engine {
         """
     }
 
-    /// Puts an app back if its swap was cut off between moving it aside and moving the new version in.
-    /// Only run while holding that tool's `ItemLock`, so a swap in progress is never mistaken for a broken one.
-    static func macRecoverSnippet(marker: String) -> String {
-        """
-        MARK="$HOME/"\(Shell.q(marker))
+    /// Puts an app back if its swap was cut off: between moving it aside and moving the new version in (the app
+    /// is gone), or while copying it to another volume (the app is there but incomplete, so its signature fails).
+    /// The marker stays until the app is back, so a failed attempt is tried again. Only run while holding that
+    /// tool's `ItemLock`, or on a marker old enough that no swap can still be running.
+    static let macRecoverBody = """
         if [ -f "$MARK" ]; then
-          A=$(sed -n 1p "$MARK"); K=$(sed -n 2p "$MARK")
-          if [ -n "$A" ] && [ ! -e "$A" ]; then
-            if [ -d "$K" ] && mkdir -p "$(dirname "$A")" && mv "$K" "$A"; then echo "RECOVERED	$A"; else echo "RECOVER_FAILED	$A"; fi
+          A=$(sed -n 1p "$MARK"); K=$(sed -n 2p "$MARK"); back=1
+          if [ -n "$A" ] && [ -d "$K" ]; then
+            if [ ! -e "$A" ] || { ! codesign --verify --strict "$A" >/dev/null 2>&1 && codesign --verify --strict "$K" >/dev/null 2>&1; }; then
+              if mkdir -p "$(dirname "$A")" && rm -rf "$A" && mv "$K" "$A"; then echo "RECOVERED	$A"; else back=0; echo "RECOVER_FAILED	$A"; fi
+            fi
+          elif [ -n "$A" ] && [ ! -e "$A" ]; then
+            echo "RECOVER_FAILED	$A"
           fi
-          rm -f "$MARK"
+          if [ $back = 1 ]; then rm -f "$MARK"; fi
         fi
 
         """
+
+    static func macRecoverSnippet(marker: String) -> String {
+        "MARK=\"$HOME/\"\(Shell.q(marker))\n" + macRecoverBody
     }
 
     static func macRecoverScript(marker: String) -> String {
@@ -405,7 +472,7 @@ extension Engine {
         var restored: [String] = []
         for m in markers {
             let lines = ((try? String(contentsOf: dir.appendingPathComponent(m), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
-            guard lines.count >= 3, let lock = ItemLock.take(lines[2]) else { continue }
+            guard lines.count >= 3, case let .success(lock) = ItemLock.take(lines[2]) else { continue }
             let res = await run(macRecoverScript(marker: "\(swapMarkersDir)/\(m)"), 120, nil)
             lock.release()
             let f = fields(res)
@@ -534,12 +601,13 @@ extension Engine {
     }
 
     /// Many apps install their own pending update as they quit (Squirrel's ShipIt, Sparkle's Autoupdate).
-    /// Waits until no such updater has been seen for 4 seconds (5 minutes at most), then reports the version.
-    static func macWaitUpdaterScript(app: String, bundleID: String, name: String) -> String {
+    /// Waits until no such updater has been seen for 4 seconds, then reports the version. Fails if the updater
+    /// is still at it after `seconds`, rather than swapping the app under it.
+    static func macWaitUpdaterScript(app: String, bundleID: String, name: String, seconds: Int = 300) -> String {
         macHeader(app: app, bundleID: bundleID) + """
         updater_running() { ps -axo command= | grep -E 'ShipIt|Autoupdate|Updater|Installer|[Ss]parkle' | grep -F -e "$BID" -e "$APP/" | grep -v grep >/dev/null; }
         idle=0; seen=0
-        for i in $(seq 1 600); do
+        for i in $(seq 1 \(seconds * 2)); do
           if updater_running; then
             idle=0
             if [ $seen = 0 ]; then seen=1; up_step \(Shell.q("\(name) is installing its own update")); fi
@@ -549,6 +617,7 @@ extension Engine {
           fi
           sleep 0.5
         done
+        if [ $idle -lt 8 ]; then up_fail \(Shell.q("\(name) is still installing its own update. Let it finish, then press Retry.")); fi
         report
 
         """
@@ -598,20 +667,22 @@ extension Engine {
         echo "INSTALLED	$NOW"
         rm -rf "$ST"
         # A saved copy of the version now installed is only a duplicate.
-        if [ -n "$NOW" ] && [ "$NOW" != "$CUR" ]; then rm -rf "$SV/$NOW"; fi
+        if [ -n "$NOW" ] && [ "$NOW" != "$CUR" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
         \(macPruneSnippet(keep: keep))
 
         """
     }
 
-    /// Keeps only the newest `keep` saved versions in "$SV".
+    /// Keeps only the newest `keep` saved versions of "$AN" in "$SV" (variants of one app share the folder).
     static func macPruneSnippet(keep: Int) -> String {
         """
         for d in "$SV"/*; do if [ -d "$d" ] && [ -z "$(ls -A "$d")" ]; then rmdir "$d"; fi; done
         n=0
         for d in $(ls -1t "$SV"); do
-          n=$((n + 1))
-          if [ $n -gt \(max(keep, 1)) ]; then rm -rf "$SV/$d"; fi
+          if [ -d "$SV/$d/$AN" ]; then
+            n=$((n + 1))
+            if [ $n -gt \(max(keep, 1)) ]; then rm -rf "$SV/$d/$AN"; rmdir "$SV/$d" 2>/dev/null || true; fi
+          fi
         done
         """
     }
@@ -640,7 +711,7 @@ extension Engine {
         touch "$SV/$V"
         echo "BACKUP	$V"
         NOW=$(current)
-        if [ -n "$NOW" ] && [ "$NOW" != "$V" ]; then rm -rf "$SV/$NOW"; fi
+        if [ -n "$NOW" ] && [ "$NOW" != "$V" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
         \(macPruneSnippet(keep: keep))
 
         """
@@ -749,6 +820,12 @@ extension Engine {
                 (s1, f1) = await step(macStageScript(app: app, bundleID: bid, name: name, url: url, info: info, stage: stage, trust: trust), 3600)
             }
             guard s1.ok, let path = f1["STAGED"] else { return failed(s1) }
+            // A feed can point at another build than it lists: never install an older one as an update.
+            let got = f1["STAGED_VERSION"] ?? ""
+            if Version.clean(got) != Version.clean(target) && (exact || !Version.isNewer(got, than: f1["CURRENT"] ?? "")) {
+                await discard()
+                return .fail("The download is \(name) \(got.isEmpty ? "of an unknown version" : got), not \(target); nothing was installed", output: log)
+            }
             if dryRun {
                 await discard()
                 return UpdateOutcome(ok: true, message: "Downloaded and checked \(f1["STAGED_VERSION"] ?? target) (dry run, nothing installed)", output: log, changed: false)
@@ -770,14 +847,19 @@ extension Engine {
         }
         if wasRunning {
             let (sc, fc) = await step(macCloneScript(app: app, bundleID: bid, stage: stage), 300)
-            if !sc.ok { Log.error("\(item.key): couldn't copy \(name) before quitting: \(failure(sc))") }
+            // Without it, an app that installs its own update on quit would leave nothing to roll back to.
+            guard sc.ok else {
+                await discard()
+                return .fail("Couldn't keep a copy of \(name) for rollback, so it wasn't quit or updated: \(failure(sc))", output: log)
+            }
             if let err = await quitApp(item, app: app, bundleID: bid, r, run: run, log: &log) {
                 await discard()
                 return .fail(err, output: log)
             }
             r.phase("Making sure \(name) isn't installing its own update")
             let (s2, f2) = await step(macWaitUpdaterScript(app: app, bundleID: bid, name: name), 400)
-            guard s2.ok else { return await giveUp(failed(s2)) }
+            // Its updater may still be working on the app: leave reopening it to that updater.
+            guard s2.ok else { await discard(); return failed(s2) }
             // Its own updater replaced it: keep the copy so it can still be rolled back.
             var kept: String?
             if let c = fc["CLONED"], !c.isEmpty, let now = f2["CURRENT"], !now.isEmpty, now != c {
@@ -822,6 +904,7 @@ extension Engine {
             if let err = await quitApp(item, app: item.path, bundleID: bid, r, run: run, log: &log) { return .fail(err, output: log) }
             let w = await run(macWaitUpdaterScript(app: item.path, bundleID: bid, name: item.name), 400, r.sink)
             log += w.combined + "\n"
+            guard w.ok else { return .fail(failure(w), output: log) }
             if let cur = fields(w)["CURRENT"], !cur.isEmpty, !target.isEmpty, !Version.isNewer(target, than: cur) {
                 if relaunch && fields(w)["RUNNING"] != "1" { await reopen(item, app: item.path, bundleID: bid, r, run: run) }
                 return UpdateOutcome(ok: true, message: "\(item.name) installed its own update to \(cur)", output: log, installed: cur)

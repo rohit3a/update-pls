@@ -55,20 +55,22 @@ enum Log {
         }
     }
 
+    /// Appends with O_APPEND, so the menu and the command line writing at once never overwrite each other.
     private static func append(_ text: String, to url: URL, rotate: Bool) {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: url.path) {
-            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            fm.createFile(atPath: url.path, contents: nil)
+        var fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        if fd < 0 {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
         }
-        guard let h = try? FileHandle(forWritingTo: url) else { return }
-        let end = (try? h.seekToEnd()) ?? 0
-        try? h.write(contentsOf: Data(text.utf8))
-        try? h.close()
-        if rotate && end > maxBytes {
-            let old = url.deletingPathExtension().appendingPathExtension("1.log")
-            try? fm.removeItem(at: old)
-            try? fm.moveItem(at: url, to: old)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        _ = Array(text.utf8).withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+        var st = stat()
+        guard rotate, fstat(fd, &st) == 0, UInt64(st.st_size) > maxBytes, flock(fd, LOCK_EX) == 0 else { return }
+        // Under the lock, and only if no other process rotated it first.
+        var now = stat()
+        if stat(url.path, &now) == 0, now.st_ino == st.st_ino {
+            rename(url.path, url.deletingPathExtension().appendingPathExtension("1.log").path)
         }
     }
 
