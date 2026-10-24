@@ -116,7 +116,7 @@ enum LocalApps {
                 Log.info("quit \(name): closed after \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
                 return true
             }
-            if !nudged && Date().timeIntervalSince(start) > 6 {
+            if !nudged && Date().timeIntervalSince(start) > 15 {
                 nudged = true
                 r.phase("Waiting for \(name) to quit. It may be asking you something.")
                 apps.first?.activate()
@@ -296,18 +296,52 @@ extension Engine {
     /// Prints the installed version, whether the app is open and whether it can be replaced without admin rights.
     /// Only the folder matters: the swap moves the whole bundle, which macOS allows even when App Management
     /// protection blocks writing inside it (so `-w "$APP"` would wrongly say no).
+    /// Also lists updates the app's own updater has already downloaded (see `pending(_:)`).
     static func macStateScript(app: String, bundleID: String) -> String {
         macHeader(app: app, bundleID: bundleID) + """
         [ -d "$APP" ] || up_fail "$APP is gone"
         report
         if [ -w "$(dirname "$APP")" ]; then echo "WRITABLE	1"; else echo "WRITABLE	0"; fi
+        # Squirrel (ShipIt) and Sparkle keep the new version ready to install when the app quits.
+        for d in "$HOME/Library/Caches/$BID.ShipIt" "$HOME/Library/Caches/$BID/org.sparkle-project.Sparkle"; do
+          if [ -d "$d" ]; then
+            while IFS= read -r a; do
+              if [ "$(defaults read "$a/Contents/Info" CFBundleIdentifier 2>/dev/null)" = "$BID" ]; then
+                echo "PENDING_APP	$(defaults read "$a/Contents/Info" CFBundleShortVersionString 2>/dev/null)	$a"
+              fi
+            done < <(find "$d" -maxdepth 5 -name '*.app' -type d -prune 2>/dev/null)
+          fi
+        done
+        # electron-updater keeps the downloaded zip and its sha512.
+        for f in "$HOME/Library/Caches/"*-updater/pending/update-info.json; do
+          if [ -f "$f" ]; then
+            z="$(dirname "$f")/$(sed -n 's/.*"fileName" *: *"\\([^"]*\\)".*/\\1/p' "$f")"
+            h=$(sed -n 's/.*"sha512" *: *"\\([^"]*\\)".*/\\1/p' "$f")
+            if [ -f "$z" ] && [ -n "$h" ]; then echo "PENDING_ZIP	$h	$z"; fi
+          fi
+        done
 
         """
     }
 
+    /// Updates the app's own updater already downloaded, from the state script: ready bundles by version,
+    /// and zips by sha512.
+    static func pending(_ r: ShellResult) -> (apps: [(version: String, path: String)], zips: [(sha512: String, path: String)]) {
+        var apps: [(String, String)] = [], zips: [(String, String)] = []
+        for line in r.stdout.split(separator: "\n") {
+            let f = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 3, !f[1].isEmpty, !f[2].isEmpty else { continue }
+            if f[0] == "PENDING_APP" { apps.append((f[1], f[2])) } else if f[0] == "PENDING_ZIP" { zips.append((f[1], f[2])) }
+        }
+        return (apps, zips)
+    }
+
     /// Downloads the publisher's build into a staging folder and checks its hash, bundle id, signature,
     /// notarization and signing team, all while the installed app keeps running.
-    static func macStageScript(app: String, bundleID: String, name: String, url: String, info: LatestInfo, stage: String, trust: Bool = true) -> String {
+    /// With `local`, takes the update the app's own updater already downloaded (a ready app, or a zip
+    /// that is checked against the published hash) instead of downloading it again.
+    static func macStageScript(app: String, bundleID: String, name: String, url: String, info: LatestInfo, stage: String,
+                               local: String? = nil, trust: Bool = true) -> String {
         var verify = ""
         if let h = info.sha256 {
             verify = """
@@ -327,24 +361,47 @@ extension Engine {
         OLD_TEAM=$(team "$APP"); NEW_TEAM=$(team "$NEW")
         [ -n "$NEW_TEAM" ] && [ "$NEW_TEAM" != "not set" ] && [ "$NEW_TEAM" = "$OLD_TEAM" ] || up_fail "Signing team changed ($OLD_TEAM -> $NEW_TEAM), not installing"
         """
+        let unpack = """
+            \(verify)
+            up_step "Unpacking"
+            if [ "$(head -c 2 "$ST/dl")" = "PK" ]; then
+              ditto -x -k "$ST/dl" "$ST/x" || up_fail "Couldn't unpack the download"
+            else
+              mkdir -p "$ST/mnt"
+              hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$ST/mnt" "$ST/dl" -quiet || up_fail "Couldn't open the disk image"
+              for a in "$ST/mnt"/*.app; do if [ -d "$a" ]; then ditto "$a" "$ST/x/$(basename "$a")"; fi; done
+              unmount
+            fi
+            rm -f "$ST/dl"
+            """
+        let fetch: String
+        if let local, local.hasSuffix(".app") || local.hasSuffix(".app/") {
+            // Cloned, so the app's updater keeps its copy (instant and free on APFS).
+            fetch = """
+            up_step \(Shell.q("Using the update \(name) already downloaded"))
+            SRC=\(Shell.q(local)); [ -d "$SRC" ] || up_fail "The downloaded update is gone; press Retry"
+            if ! cp -cR "$SRC" "$ST/x/$(basename "$SRC")" 2>/dev/null; then rm -rf "$ST/x"/*; ditto "$SRC" "$ST/x/$(basename "$SRC")"; fi
+            """
+        } else if let local {
+            fetch = """
+            up_step \(Shell.q("Using the update \(name) already downloaded"))
+            SRC=\(Shell.q(local)); [ -f "$SRC" ] || up_fail "The downloaded update is gone; press Retry"
+            cp -c "$SRC" "$ST/dl" 2>/dev/null || cp "$SRC" "$ST/dl"
+            \(unpack)
+            """
+        } else {
+            fetch = """
+            up_step \(Shell.q("Downloading \(name) \(info.version)"))
+            curl -fL --retry 2 --connect-timeout 20 --speed-limit 4096 --speed-time 60 -# -o "$ST/dl" "$URL" || up_fail "Download failed"
+            \(unpack)
+            """
+        }
         return macHeader(app: app, bundleID: bundleID) + """
         URL=\(Shell.q(url)); ST="$HOME/"\(Shell.q(stage))
         unmount() { if [ -d "$ST/mnt" ]; then hdiutil detach "$ST/mnt" -quiet -force >/dev/null 2>&1 || true; rmdir "$ST/mnt" 2>/dev/null || true; fi; }
         trap unmount EXIT
         rm -rf "$ST"; mkdir -p "$ST/x"
-        up_step \(Shell.q("Downloading \(name) \(info.version)"))
-        curl -fL --retry 2 --connect-timeout 20 --speed-limit 4096 --speed-time 60 -# -o "$ST/dl" "$URL" || up_fail "Download failed"
-        \(verify)
-        up_step "Unpacking"
-        if [ "$(head -c 2 "$ST/dl")" = "PK" ]; then
-          ditto -x -k "$ST/dl" "$ST/x" || up_fail "Couldn't unpack the download"
-        else
-          mkdir -p "$ST/mnt"
-          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$ST/mnt" "$ST/dl" -quiet || up_fail "Couldn't open the disk image"
-          for a in "$ST/mnt"/*.app; do if [ -d "$a" ]; then ditto "$a" "$ST/x/$(basename "$a")"; fi; done
-          unmount
-        fi
-        rm -f "$ST/dl"
+        \(fetch)
         up_step "Checking signature"
         NEW=""
         while IFS= read -r a; do
@@ -569,8 +626,20 @@ extension Engine {
         var staged: String?
         var wasRunning = f0["RUNNING"] == "1"
         if case let .download(info) = source {
-            guard let url = info.url else { return .fail("No download is published for \(target)", output: log) }
-            let (s1, f1) = await step(macStageScript(app: app, bundleID: bid, name: name, url: url, info: info, stage: stage, trust: trust), 3600)
+            // The app's own updater may have this version ready already: no need to download it again.
+            let ready = pending(s0)
+            let local = ready.apps.first { Version.clean($0.version) == Version.clean(target) }?.path
+                ?? info.sha512Base64.flatMap { h in ready.zips.first { $0.sha512 == h }?.path }
+            guard let url = info.url ?? local else { return .fail("No download is published for \(target)", output: log) }
+            if let local { Log.info("\(item.key): using the update \(name) already downloaded: \(local)") }
+            var (s1, f1) = await step(macStageScript(app: app, bundleID: bid, name: name, url: url, info: info, stage: stage,
+                                                     local: local, trust: trust), 3600)
+            // The app's copy may be mid-way through being patched, or not what it seemed: download it after all.
+            if local != nil, let url = info.url,
+               !s1.ok || f1["STAGED"] == nil || Version.clean(f1["STAGED_VERSION"] ?? "") != Version.clean(target) {
+                Log.info("\(item.key): the update \(name) already downloaded didn't check out (\(s1.ok ? "version \(f1["STAGED_VERSION"] ?? "?")" : failure(s1))); downloading it")
+                (s1, f1) = await step(macStageScript(app: app, bundleID: bid, name: name, url: url, info: info, stage: stage, trust: trust), 3600)
+            }
             guard s1.ok, let path = f1["STAGED"] else { return failed(s1) }
             if dryRun {
                 await discard()

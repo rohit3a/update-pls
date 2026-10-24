@@ -201,6 +201,78 @@ final class UpdatePlsTests: XCTestCase {
         }
     }
 
+    /// A version the app's own updater (ShipIt, Sparkle) already has ready is used instead of downloading it again.
+    /// Its leftovers from older updates are ignored, and its own copy is left where it is.
+    func testMacAppUpdateUsesUpdateTheAppAlreadyDownloaded() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let caches = sandbox.home.appendingPathComponent("Library/Caches")
+        let ready = caches.appendingPathComponent("com.example.t.ShipIt/update.abc/T.app")
+        try sandbox.makeApp(at: ready, version: "2.0")
+        try sandbox.makeApp(at: caches.appendingPathComponent("com.example.t/org.sparkle-project.Sparkle/Installation/x/y/T.app"), version: "1.5")
+        var item = sandbox.item(installed: "1.0")
+        // Nothing to download from: the update has to come from the ready copy.
+        item.latest = LatestInfo(version: "2.0", url: "file:///nonexistent/T-2.0.zip")
+        let phases = Box<[String]>([])
+        let o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false,
+                                           Reporter { text, _ in phases.mutate { $0.append(text) } }, trust: false, run: sandbox.runner)
+        XCTAssertTrue(o.ok, o.message + "\n" + o.output)
+        XCTAssertEqual(o.message, "Updated to 2.0")
+        XCTAssertEqual(sandbox.version(sandbox.app), "2.0")
+        XCTAssertTrue(phases.value.contains("Using the update T already downloaded"), "\(phases.value)")
+        XCTAssertFalse(phases.value.contains { $0.hasPrefix("Downloading") })
+        XCTAssertEqual(sandbox.version(ready), "2.0", "the updater's own copy stays")
+    }
+
+    /// A ready copy that turns out not to be the right build (say, Sparkle is still patching it) is dropped for a download.
+    func testMacAppUpdateDownloadsWhenTheAppsCopyDoesntCheckOut() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let ready = sandbox.home.appendingPathComponent("Library/Caches/com.example.t/org.sparkle-project.Sparkle/Installation/x/y/T.app")
+        try sandbox.makeApp(at: ready, version: "2.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        var item = sandbox.item(installed: "1.0")
+        item.latest = LatestInfo(version: "2.0", url: zip.absoluteString, sha256: try sandbox.sha256(zip))
+        let run: Engine.ScriptRunner = { script, timeout, out in
+            if script.contains("Using the update") { try? Sandbox.writeInfo(ready, version: "1.9") }
+            return await sandbox.runner(script, timeout, out)
+        }
+        let phases = Box<[String]>([])
+        let o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false,
+                                           Reporter { text, _ in phases.mutate { $0.append(text) } }, trust: false, run: run)
+        XCTAssertTrue(o.ok, o.message + "\n" + o.output)
+        XCTAssertEqual(sandbox.version(sandbox.app), "2.0")
+        XCTAssertTrue(phases.value.contains("Using the update T already downloaded") && phases.value.contains("Downloading T 2.0"), "\(phases.value)")
+    }
+
+    /// electron-updater's downloaded zip is used when its hash is the published one, and ignored otherwise.
+    func testMacAppUpdateUsesElectronUpdaterZip() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        let pending = sandbox.home.appendingPathComponent("Library/Caches/t-updater/pending")
+        try FileManager.default.createDirectory(at: pending, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: zip, to: pending.appendingPathComponent("T-2.0.zip"))
+        let hash = await Shell.run("/bin/bash", ["-c", "openssl dgst -sha512 -binary \(Shell.q(zip.path)) | base64"]).stdout
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try #"{"fileName":"T-2.0.zip","sha512":"\#(hash)","isAdminRightsRequired":false}"#
+            .write(to: pending.appendingPathComponent("update-info.json"), atomically: true, encoding: .utf8)
+        var item = sandbox.item(installed: "1.0")
+        item.latest = LatestInfo(version: "2.0", url: "file:///nonexistent/T-2.0.zip", sha512Base64: hash)
+        var o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, run: sandbox.runner)
+        XCTAssertTrue(o.ok, o.message + "\n" + o.output)
+        XCTAssertEqual(sandbox.version(sandbox.app), "2.0")
+
+        // A different published hash means it's not that build: download it instead (and fail here, as there's nothing to download).
+        try Sandbox.writeInfo(sandbox.app, version: "1.0")
+        item.latest = LatestInfo(version: "2.0", url: "file:///nonexistent/T-2.0.zip", sha512Base64: "other")
+        o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                       trust: false, run: sandbox.runner)
+        XCTAssertFalse(o.ok)
+        XCTAssertEqual(o.message.components(separatedBy: ":").first, "Download failed")
+    }
+
     /// An app that wasn't open is updated in place and stays closed, even with reopening on.
     func testMacAppUpdateLeavesClosedAppClosed() async throws {
         let sandbox = try Sandbox()
