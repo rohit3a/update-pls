@@ -2,6 +2,8 @@
 
 A macOS menu bar app that keeps every AI coding tool up to date, on this Mac and on every machine in your `~/.ssh/config`.
 
+![What's new in Update pls 0.5.2: checks in about 2 seconds that survive sleep and full disks](docs/update-pls-0.5.2.gif)
+
 Claude Desktop and the Codex app don't have an update button. Update pls gives you one for each tool, plus **Update all**.
 
 - Updates each tool the way it was installed: npm, Homebrew, its own updater, pipx, uv, bun, the publisher's download, apt or winget.
