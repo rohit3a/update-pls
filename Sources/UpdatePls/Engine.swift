@@ -137,28 +137,43 @@ struct MachineStatus: Identifiable, Hashable {
     var id: String { machine.id }
 }
 
+/// Time this Mac has spent asleep: the gap between a clock that runs during sleep and one that doesn't.
+enum SleepClock {
+    static var asleep: TimeInterval {
+        Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) &- clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9
+    }
+
+    /// "4.2s", or "944.4s (940.1s of it asleep)" when the Mac slept in the middle.
+    static func took(since start: Date, asleep before: TimeInterval) -> String {
+        let slept = asleep - before
+        return String(format: "%.1fs", Date().timeIntervalSince(start)) + (slept > 1 ? String(format: " (%.1fs of it asleep)", slept) : "")
+    }
+}
+
 enum Engine {
     /// Finds what is installed on a machine and the newest version of each.
     /// `known` reuses latest versions already looked up (by item key), so a re-check after an update stays quick.
     static func check(_ m: Machine, catalog: Catalog, resolver: LatestResolver, known: [String: LatestInfo] = [:]) async -> (MachineStatus, [Item]) {
-        let start = Date()
+        let start = Date(), asleep = SleepClock.asleep
         var status = MachineStatus(machine: m)
-        let os: OSKind
-        switch await Runner.detectOS(m) {
-        case let .offline(msg):
+        var scan = await scan(m, catalog)
+        // A connection that dropped mid-scan, or that the Mac's sleep cut off (a background check runs in the
+        // few seconds of a dark wake), says nothing about the machine: try it once more.
+        if case let .failed(what, msg, dropped) = scan, dropped || SleepClock.asleep - asleep > 1 {
+            Log.info("check \(m.id): \(what): \(msg); trying again")
+            scan = await self.scan(m, catalog)
+        }
+        let os: OSKind, out: ShellResult
+        switch scan {
+        case let .failed(what, msg, _):
             status.state = .offline(msg)
-            Log.error("check \(m.id): offline: \(msg)")
+            Log.error("check \(m.id): \(what): \(msg)")
             return (status, [])
-        case let .os(o): os = o
+        case let .done(o, r): (os, out) = (o, r)
         }
         status.os = os
-        let script = os == .windows ? Probe.windowsScript(catalog) : Probe.unixScript(catalog)
-        let out = await Runner.run(m, os: os, script: script, timeout: 240)
-        if out.status == 255 || (out.timedOut && out.stdout.isEmpty) {
-            let msg = out.timedOut ? "Timed out" : out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            status.state = .offline(msg)
-            Log.error("check \(m.id): scan failed: \(msg)")
-            return (status, [])
+        if let full = out.stderr.split(separator: "\n").first(where: { $0.contains("Disk quota exceeded") || $0.contains("No space left on device") }) {
+            Log.error("check \(m.id): its disk is full, so this check may be missing tools: \(full)")
         }
         if !out.ok {
             Log.error("check \(m.id): scan exited \(out.status)\(out.timedOut ? " (timed out, results may be partial)" : "")\n"
@@ -177,9 +192,30 @@ enum Engine {
             for await (i, info) in group { items[i].latest = info }
         }
         for i in items.indices { items[i].state = state(items[i]) }
-        Log.info("check \(m.id) [\(os.rawValue)]: \(items.count) tools in \(String(format: "%.1f", Date().timeIntervalSince(start)))s\n"
+        Log.info("check \(m.id) [\(os.rawValue)]: \(items.count) tools in \(SleepClock.took(since: start, asleep: asleep))\n"
                  + items.map { "\($0.key) \($0.summary) \($0.state)\($0.running ? " open" : "")" }.joined(separator: "\n"))
         return (status, items)
+    }
+
+    private enum Scan {
+        case done(OSKind, ShellResult)
+        /// `dropped`: the machine answered, then the connection went away.
+        case failed(String, String, dropped: Bool)
+    }
+
+    private static func scan(_ m: Machine, _ catalog: Catalog) async -> Scan {
+        let os: OSKind
+        switch await Runner.detectOS(m) {
+        case let .offline(msg): return .failed("offline", msg, dropped: false)
+        case let .os(o): os = o
+        }
+        let script = os == .windows ? Probe.windowsScript(catalog) : Probe.unixScript(catalog)
+        let out = await Runner.run(m, os: os, script: script, timeout: 240)
+        if out.status == 255 || (out.timedOut && out.stdout.isEmpty) {
+            let msg = out.timedOut ? "Timed out" : out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .failed("scan failed", msg, dropped: out.status == 255 && !out.timedOut)
+        }
+        return .done(os, out)
     }
 
     static func state(_ item: Item) -> ItemState {

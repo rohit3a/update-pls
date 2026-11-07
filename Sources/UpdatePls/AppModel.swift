@@ -183,7 +183,7 @@ final class AppModel: ObservableObject {
     func checkAll(_ reason: CheckReason = .manual) async {
         guard !isChecking, !(reason != .startup && isBusy) else { return }
         isChecking = true
-        let start = Date()
+        let start = Date(), asleep = SleepClock.asleep
         Log.info("checking all machines (\(reason.rawValue))")
         hosts = SSHConfig.hosts()
         // The command line may have recorded versions or skips since this app started.
@@ -227,7 +227,7 @@ final class AppModel: ObservableObject {
         }
         lastCheck = Date()
         isChecking = false
-        Log.info("check done in \(String(format: "%.1f", Date().timeIntervalSince(start)))s: \(pendingUpdates.count) updates waiting"
+        Log.info("check done in \(SleepClock.took(since: start, asleep: asleep)): \(pendingUpdates.count) updates waiting"
                  + (selfUpdateAvailable ? ", and Update pls \(self.selfLatest ?? "")" : ""))
         notifyNewUpdates()
     }

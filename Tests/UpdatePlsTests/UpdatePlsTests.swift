@@ -2,6 +2,17 @@ import XCTest
 @testable import UpdatePls
 
 final class UpdatePlsTests: XCTestCase {
+    /// Tests log to a throwaway folder, never to the real ~/Library/Logs/Update pls.
+    override class func setUp() {
+        super.setUp()
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-tests-log-\(UUID().uuidString)")
+    }
+
+    override class func tearDown() {
+        try? FileManager.default.removeItem(at: Log.dir)
+        super.tearDown()
+    }
+
     func testVersionExtract() {
         XCTAssertEqual(Version.extract("2.1.303 (Claude Code)"), "2.1.303")
         XCTAssertEqual(Version.extract("codex-cli 0.163.0"), "0.163.0")
@@ -139,6 +150,94 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(v, "0.1.1-nightly.20261019.3360")
         XCTAssertEqual(files.map(\.url), ["T3-Code-0.1.1-arm64.zip", "T3-Code-0.1.1-x64.zip"])
         XCTAssertEqual(files.first?.sha512, "abc==")
+    }
+
+    /// The scan reads versions from package.json or a native installer's versions folder without starting the
+    /// tool (each stand-in here hangs if started), asks the rest, and never waits on a hung command.
+    func testProbeReadsVersionsWithoutStartingTools() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("up-probe-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let bin = root.appendingPathComponent("bin")
+        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
+        func tool(_ path: String, _ body: String = "sleep 30") throws -> URL {
+            let u = root.appendingPathComponent(path)
+            try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "#!/bin/sh\n\(body)\n".write(to: u, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: u.path)
+            return u
+        }
+        func link(_ name: String, _ target: URL) throws {
+            try fm.createSymbolicLink(at: bin.appendingPathComponent(name), withDestinationURL: target)
+        }
+        try link("claude", tool(".local/share/claude/versions/2.1.318"))
+        try link("t3", tool(".t3/runtime/versions/0.1.8-nightly.20261106.4262/t3"))
+        let codex = try tool("lib/node_modules/@openai/codex/bin/codex.js")
+        try "{\n  \"name\": \"@openai/codex\",\n  \"version\": \"0.167.0\"\n}\n"
+            .write(to: root.appendingPathComponent("lib/node_modules/@openai/codex/package.json"), atomically: true, encoding: .utf8)
+        try link("codex", codex)
+        _ = try tool("bin/npm", "exit 0")
+        // pyenv keeps Python versions, not the tool's, in a versions folder: this one has to be asked.
+        try link("aider", tool(".pyenv/versions/3.12.1/bin/aider", "echo 'aider 0.86.0'"))
+
+        let script = Probe.unixPrelude + Probe.unixFunctions + """
+        export PATH=\(Shell.q(bin.path)):"$PATH"
+        up_cli claude-code claude; up_cli t3 t3; up_cli codex codex; up_cli aider aider
+        s=$(date +%s); up_to 1 sleep 30; r=$?; printf 'UPTO\\t%s\\t%s\\n' "$r" "$(( $(date +%s) - s ))"
+        """
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "{\n" + script + "\n} </dev/null"]
+        p.standardOutput = out
+        let start = Date()
+        try p.run()
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10, "no tool was started and left to hang:\n" + text)
+
+        let items = Engine.buildItems(Probe.parse(text), machine: .local, catalog: Catalog.bundled())
+        let installed = Dictionary(uniqueKeysWithValues: items.map { ($0.defID, $0.installed ?? "") })
+        XCTAssertEqual(installed, ["claude-code": "2.1.318", "t3": "0.1.8-nightly.20261106.4262", "codex": "0.167.0", "aider": "0.86.0"], text)
+        if case .npm(_, _, "@openai/codex", _, _) = items.first(where: { $0.defID == "codex" })?.method {} else { XCTFail("codex is an npm install: \(text)") }
+        let upto = try XCTUnwrap(text.split(separator: "\n").first { $0.hasPrefix("UPTO") }).split(separator: "\t")
+        XCTAssertNotEqual(upto[1], "0", "the hung command was stopped")
+        XCTAssertLessThanOrEqual(Int(upto[2]) ?? 99, 3)
+    }
+
+    /// A full disk or quota where the scan keeps its per-tool files must not make tools go missing: it reads
+    /// them one by one instead, and finds the same as with somewhere to write.
+    func testProbeWithoutAWritableTempFolder() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("up-full-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("home"), tmp = root.appendingPathComponent("tmp"), full = root.appendingPathComponent("full")
+        let bin = home.appendingPathComponent(".local/bin")
+        for d in [bin, tmp, full] { try fm.createDirectory(at: d, withIntermediateDirectories: true) }
+        defer {
+            for d in [home, full] { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: d.path) }
+            try? fm.removeItem(at: root)
+        }
+        for (name, v) in [("up-fake-a", "1.2.3"), ("up-fake-b", "4.5.6")] {
+            let u = bin.appendingPathComponent(name)
+            try "#!/bin/sh\necho \(v)\n".write(to: u, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: u.path)
+        }
+        let catalog = Catalog(clis: [CLIDef(id: "a", name: "A", binaries: ["up-fake-a"]), CLIDef(id: "b", name: "B", binaries: ["up-fake-b"])], apps: [])
+        func scan(tmpdir: URL) throws -> [String] {
+            let p = Process(), out = Pipe()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = ["-c", "{\n" + Probe.unixScript(catalog) + "\n} </dev/null"]
+            p.environment = ["HOME": home.path, "TMPDIR": tmpdir.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/bash"]
+            p.standardOutput = out
+            try p.run()
+            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            p.waitUntilExit()
+            return Probe.parse(text).clis.map { "\($0.id) \(Version.extract($0.versionOutput) ?? "")" }
+        }
+        XCTAssertEqual(try scan(tmpdir: tmp), ["a 1.2.3", "b 4.5.6"])
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: tmp.path), [], "its folder is removed afterwards")
+        // Nowhere to write: TMPDIR refuses files, and so does $HOME (no ~/.cache).
+        for d in [full, home] { try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: d.path) }
+        XCTAssertEqual(try scan(tmpdir: full), ["a 1.2.3", "b 4.5.6"])
     }
 
     func testRollback() throws {

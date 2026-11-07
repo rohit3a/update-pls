@@ -84,8 +84,10 @@ actor LatestResolver {
         for rel in releases {
             guard let tag = rel["tag_name"] as? String, let assets = rel["assets"] as? [[String: Any]],
                   let yml = assets.first(where: { $0["name"] as? String == ymlName }),
-                  let ymlURL = yml["browser_download_url"] as? String,
-                  let text = await Self.get(ymlURL).map({ String(decoding: $0, as: UTF8.self) }) else { continue }
+                  let ymlURL = yml["browser_download_url"] as? String else { continue }
+            // A feed that can't be fetched means the network is down: stop, rather than try every release
+            // (30 lookups of up to 20 seconds each); the last known version stands in.
+            guard let text = await Self.get(ymlURL).map({ String(decoding: $0, as: UTF8.self) }) else { return nil }
             let (version, files) = Self.parseElectronYml(text)
             let wantArm = arch == "arm64"
             // A release without a usable zip (still uploading, or broken) is skipped, not the end of the search.

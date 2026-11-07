@@ -979,6 +979,9 @@ extension Engine {
         }
         if message.contains("Operation not permitted") {
             message += " (allow Update pls in System Settings › Privacy & Security › App Management)"
+        } else if message.lowercased().contains("unauthenticated") {
+            // Cursor Agent's own updater refuses to run until you sign in on that machine.
+            message += " (sign in to it on that machine first, then press Retry)"
         }
         return message.count > 360 ? String(message.prefix(360)) + "…" : message
     }

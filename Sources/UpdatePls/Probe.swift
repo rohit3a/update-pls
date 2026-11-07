@@ -49,7 +49,17 @@ enum Probe {
     }
     UP_P=$(up_login_path | sed -n 's/^__UPP__//p' | tail -1)
     export PATH="${UP_P:+$UP_P:}$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-    up_to() { t=$1; shift; if command -v timeout >/dev/null 2>&1; then timeout "$t" "$@"; else "$@"; fi; }
+    # macOS has no `timeout`: there the command is stopped by a sleeper instead, so nothing can hang a check.
+    up_to() {
+      t=$1; shift
+      if command -v timeout >/dev/null 2>&1; then timeout "$t" "$@"; return; fi
+      "$@" & up_c=$!
+      ( sleep "$t"; kill $up_c ) >/dev/null 2>&1 &
+      up_s=$!
+      wait $up_c; up_r=$?
+      kill $up_s 2>/dev/null
+      return $up_r
+    }
 
     """#
 
@@ -102,28 +112,38 @@ enum Probe {
 
     static let unixFunctions = #"""
     up_real() { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"; }
-    up_field() {
+    # A package.json's name and version as name|version, in one go.
+    up_pkg() {
       n=$(command -v node 2>/dev/null)
-      if [ -n "$n" ]; then "$n" -p "require(process.argv[1]).$2" "$1" 2>/dev/null
-      else sed -n "s/^  \"$2\": *\"\([^\"]*\)\".*/\1/p" "$1" | head -1; fi
+      if [ -n "$n" ]; then "$n" -e 'const j=require(process.argv[1]);console.log(j.name+"|"+j.version)' "$1" 2>/dev/null
+      else echo "$(up_jfield name "$1")|$(up_jfield version "$1")"; fi
     }
+    up_jfield() { sed -n "s/^  \"$1\": *\"\([^\"]*\)\".*/\1/p" "$2" | head -1; }
     up_cli() {
       id=$1; shift
       for b in "$@"; do
         p=$(command -v "$b" 2>/dev/null) || continue
         case "$p" in /*) ;; *) continue ;; esac
         r=$(up_real "$p")
-        v=$(up_to 20 "$p" --version </dev/null 2>&1 | head -3 | tr '\t\n\r' '   ')
-        pkg=""; pv=""; nb=""; w=0
+        v=""; pkg=""; pv=""; nb=""; w=0
         case "$r" in */node_modules/*)
           d=$(dirname "$r")
           while [ "$d" != "/" ] && [ ! -f "$d/package.json" ]; do d=$(dirname "$d"); done
           if [ -f "$d/package.json" ]; then
-            pkg=$(up_field "$d/package.json" name); pv=$(up_field "$d/package.json" version)
+            IFS='|' read -r pkg pv <<< "$(up_pkg "$d/package.json")"
             if [ -x "$(dirname "$p")/npm" ]; then nb="$(dirname "$p")/npm"; else nb=$(command -v npm 2>/dev/null); fi
             [ -w "$(dirname "$d")" ] && w=1
           fi ;;
         esac
+        # Native installers keep each version in its own folder (claude: versions/2.1.318, t3: versions/0.1.8/t3),
+        # so the version is read from there instead of starting the tool, which can take seconds.
+        if [ -z "$pv" ]; then
+          case "$r" in */versions/[0-9]*.*)
+            t=${r##*/versions/}
+            case "$t" in */*/*) ;; *) v=${t%%/*} ;; esac ;;
+          esac
+          [ -n "$v" ] || v=$(up_to 20 "$p" --version </dev/null 2>&1 | head -3 | tr '\t\n\r' '   ')
+        fi
         printf 'CLI\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$b" "$p" "$r" "$v" "$pkg" "$pv" "$nb" "$w"
         return
       done
@@ -135,7 +155,7 @@ enum Probe {
         v=$(defaults read "$a/Contents/Info" CFBundleShortVersionString 2>/dev/null)
         bid=$(defaults read "$a/Contents/Info" CFBundleIdentifier 2>/dev/null)
         run=0
-        ps -axo command= | grep -F "$a/Contents/MacOS/" | grep -v grep >/dev/null && run=1
+        printf '%s\n' "$UP_PS" | grep -F "$a/Contents/MacOS/" >/dev/null && run=1
         printf 'APP\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$a" "$v" "$bid" "$run"
         for s in "$HOME/Library/Application Support/Update pls/Backups/$1"/*/"$2.app" "$HOME/Library/Application Support/Update pls/Backups/$1/$2.app"; do
           [ -d "$s" ] && printf 'SAVED\t%s\t%s\t%s\n' "$1" "$2" "$(defaults read "$s/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
@@ -163,10 +183,24 @@ enum Probe {
     static func unixScript(_ c: Catalog) -> String {
         var s = unixPrelude + debFunctions + unixFunctions
         // Each tool is read at the same time (a --version or apt-cache can take seconds), into its own file,
-        // and the files are printed in order at the end.
-        s += "UP_O=$(mktemp -d 2>/dev/null) || { UP_O=\"$HOME/.update-pls-probe.$$\"; mkdir -p \"$UP_O\"; }\n"
+        // and the files are printed in order at the end. The folder must really take writes: on a full disk or
+        // quota (a tmpfs /tmp with usrquota) each file would come back empty and the tools would silently go
+        // missing. With no such folder, the tools are read one after another, straight to the output.
+        s += #"""
+        up_tmp() {
+          for base in "${TMPDIR:-/tmp}" "$HOME/.cache"; do
+            mkdir -p "$base" 2>/dev/null
+            d=$(mktemp -d "$base/update-pls.XXXXXX" 2>/dev/null) || continue
+            if head -c 65536 /dev/zero > "$d/.w" 2>/dev/null; then rm -f "$d/.w"; echo "$d"; return; fi
+            rm -rf "$d"
+          done
+        }
+        up_job() { f=$1; shift; if [ -n "$UP_O" ]; then "$@" > "$UP_O/$f" & else "$@"; fi; }
+        UP_O=$(up_tmp)
+
+        """#
         for (n, d) in c.clis.enumerated() {
-            s += "up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + " > \"$UP_O/c\(String(format: "%03d", n))\" &\n"
+            s += "up_job c\(String(format: "%03d", n)) up_cli " + ([d.id] + d.binaries).map(Shell.q).joined(separator: " ") + "\n"
         }
         s += "if [ \"$(uname -s)\" = Darwin ]; then\n"
         // A swap cut off on this Mac leaves the app missing, so it wouldn't even be listed: put it back first.
@@ -174,7 +208,11 @@ enum Probe {
         s += "  for MARK in \"$HOME/\(Engine.swapMarkersDir)\"/*; do\n"
             + "    if [ -f \"$MARK\" ] && [ -n \"$(find \"$MARK\" -mmin +15 2>/dev/null)\" ]; then\n"
             + Engine.macRecoverBody + "    fi\n  done\n"
-        for d in c.apps { for v in d.mac ?? [] { s += "  up_app \(Shell.q(d.id)) \(Shell.q(v.app))\n" } }
+        // One process list for every app, and the apps read at the same time too.
+        s += "  UP_PS=$(ps -axo command= 2>/dev/null)\n"
+        for (n, (d, v)) in c.apps.flatMap({ d in (d.mac ?? []).map { (d, $0) } }).enumerated() {
+            s += "  up_job a\(String(format: "%03d", n)) up_app \(Shell.q(d.id)) \(Shell.q(v.app))\n"
+        }
         let debs = c.apps.flatMap { $0.linuxDeb ?? [] }.map(Shell.q).joined(separator: " ")
         s += "elif command -v dpkg-query >/dev/null 2>&1; then\n  if sudo -n true >/dev/null 2>&1; then\n    printf 'SUDO\\t1\\n'\n"
         // apt only learns about new versions when its lists are refreshed, which Ubuntu does about twice a day.
@@ -185,11 +223,11 @@ enum Probe {
         }
         s += "  fi\n"
         for (n, p) in c.apps.flatMap({ d in (d.linuxDeb ?? []).map { (d.id, $0) } }).enumerated() {
-            s += "  up_deb \(Shell.q(p.0)) \(Shell.q(p.1)) > \"$UP_O/d\(String(format: "%03d", n))\" &\n"
+            s += "  up_job d\(String(format: "%03d", n)) up_deb \(Shell.q(p.0)) \(Shell.q(p.1))\n"
         }
         s += "fi\n"
         // The exit status of the last probe line means nothing; don't report it as a failed scan.
-        s += "wait\ncat \"$UP_O\"/* 2>/dev/null\nrm -rf \"$UP_O\"\ntrue\n"
+        s += "wait\nif [ -n \"$UP_O\" ]; then cat \"$UP_O\"/* 2>/dev/null; rm -rf \"$UP_O\"; fi\ntrue\n"
         return s
     }
 
