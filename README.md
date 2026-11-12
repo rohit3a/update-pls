@@ -115,6 +115,10 @@ Settings → **Add your own tools…** opens `~/.config/update-pls/harnesses.jso
 
 `latest` can be `npm`, `pypi`, `github` (`owner/repo`), `cask`, `electronGithub` (`{ repo, channel }`), `squirrel` (a Squirrel.Mac update URL, with `{platform}` for darwin-arm64 or darwin-x64), or `scrape` (`{ url, regex }`). Tools with the same `brand` are grouped together. Pull requests that add popular tools to the catalog are welcome.
 
+## Engineering specs
+
+- [Portable installation and safe SSH host discovery](docs/specs/MIGRATION-RELIABILITY-2026-11-12.md)
+
 ## Status
 
 Tested on macOS and Ubuntu over SSH. Windows hosts (PowerShell + winget) are implemented but not yet tested on a real machine.
