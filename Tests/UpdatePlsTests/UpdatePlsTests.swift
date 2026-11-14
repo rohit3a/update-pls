@@ -1011,6 +1011,31 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(model.waitingForSignIn.isEmpty)
     }
 
+    /// Pressing Update with a row's old copy just after its update ended mustn't run it again.
+    @MainActor
+    func testStalePressAfterAnUpdateDoesNothing() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let previous = UserDefaults.standard.object(forKey: "previousVersions")
+        defer { UserDefaults.standard.set(previous, forKey: "previousVersions") }
+        let model = AppModel(autostart: false)
+        var a = Item(machine: .local, os: .mac, defID: "a", name: "A", brand: "A", isApp: false, path: "/a",
+                     installed: "1.0", latest: LatestInfo(version: "2.0"), method: .selfUpdate(path: "/a", args: "update"))
+        a.state = .available
+        model.items = [a]
+        let runs = Box(0)
+        model.perform = { _, _, _ in runs.mutate { $0 += 1 }; return UpdateOutcome(ok: true, message: "Updated", previous: "1.0") }
+        var a2 = a; a2.installed = "2.0"; a2.state = .upToDate
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [a2]) }
+        model.update(a)
+        for _ in 0..<40 where model.isBusy { try await Task.sleep(for: .milliseconds(25)) }
+        model.update(a)
+        model.updateAll()
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(runs.value, 1)
+    }
+
     func testRunningRowShowsTimeAndQuietSpells() {
         XCTAssertNil(ItemRow.timing(nil))
         XCTAssertNil(ItemRow.timing((elapsed: 9, quiet: 9)), "short steps show no clock")

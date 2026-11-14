@@ -430,6 +430,10 @@ extension Engine {
         current() { defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true; }
         app_running() { ps -axo command= | grep -F "$APP/Contents/MacOS/" | grep -v grep >/dev/null; }
         report() { echo "CURRENT	$(current)"; if app_running; then echo "RUNNING	1"; else echo "RUNNING	0"; fi; }
+        # Saved copies keep the app's bundle ID; unregistered, macOS never opens one in place of the real app.
+        up_unregister() { LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister; "$LSREG" -u "$1" >/dev/null 2>&1 || true; }
+        # The main process of this app running from Update pls's saved copies instead of "$APP".
+        saved_copy_pids() { ps -axo pid=,command= | grep -F "/Update pls/Backups/" | grep -F "/$(basename "$APP")/Contents/MacOS/$(basename "$APP" .app)" | grep -v grep | awk '{print $1}' || true; }
 
         """
     }
@@ -689,6 +693,7 @@ extension Engine {
         MARK=\(marker.map { "\"$HOME/\"" + Shell.q($0) } ?? "\"$ST/.nomark\"")
         mkdir -p "$(dirname "$MARK")"; printf '%s\\n%s\\n%s\\n' "$APP" "$KEEP/$AN" \(Shell.q(key)) > "$MARK"
         mv "$APP" "$KEEP/$AN" || up_fail "Couldn't move the current version aside"
+        up_unregister "$KEEP/$AN"
         if ! mv "$NEW" "$APP"; then rm -rf "$APP"; mv "$KEEP/$AN" "$APP"; rm -f "$MARK"; up_fail "Couldn't install \(name) $WANT; the previous version was put back"; fi
         rm -f "$MARK"
         touch "$KEEP"
@@ -738,6 +743,7 @@ extension Engine {
         V=$(defaults read "$PRE/Contents/Info" CFBundleShortVersionString)
         rm -rf "$SV/$V/$AN"; mkdir -p "$SV/$V"
         mv "$PRE" "$SV/$V/$AN"
+        up_unregister "$SV/$V/$AN"
         touch "$SV/$V"
         echo "BACKUP	$V"
         NOW=$(current)
@@ -748,7 +754,18 @@ extension Engine {
     }
 
     static func macOpenScript(app: String, bundleID: String) -> String {
-        macHeader(app: app, bundleID: bundleID) + "if ! app_running; then open -g \"$APP\"; fi\n"
+        macHeader(app: app, bundleID: bundleID) + """
+        # An app's own updater can relaunch the copy that was just moved aside: close it and open the real one.
+        for i in 1 2 3; do
+          P=$(saved_copy_pids)
+          [ -n "$P" ] || break
+          echo "Closing $(basename "$APP" .app) opened from a saved copy"
+          kill -TERM $P 2>/dev/null || true
+          for _ in $(seq 1 40); do [ -z "$(saved_copy_pids)" ] && break; sleep 0.25; done
+        done
+        if ! app_running; then open -g "$APP"; fi
+
+        """
     }
 
     /// `KEY<tab>value` lines from a script's output.
@@ -977,7 +994,10 @@ extension Engine {
         } else {
             message = "Exited with code \(r.status)"
         }
-        if message.contains("Operation not permitted") {
+        if (r.stdout + r.stderr).contains("Could not detect the installation method") {
+            // OpenCode's updater, on a binary copied over by Migration Assistant or by hand.
+            message = "Its updater can't tell how it was installed (copied from another Mac?). Reinstall it once, then Update works."
+        } else if message.contains("Operation not permitted") {
             message += " (allow Update pls in System Settings › Privacy & Security › App Management)"
         } else if message.lowercased().contains("unauthenticated") {
             // Cursor Agent's own updater refuses to run until you sign in on that machine.

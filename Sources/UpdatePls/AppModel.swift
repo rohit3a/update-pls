@@ -273,7 +273,10 @@ final class AppModel: ObservableObject {
     // MARK: Updating
 
     func update(_ item: Item) {
-        guard item.canUpdate, !isActive(item), confirmQuit([item]) else { return }
+        // Jobs finish one by one now, so a press can arrive with a row's old copy just after its update ended:
+        // only what the latest check says is still waiting gets queued.
+        let item = items.first { $0.key == item.key } ?? item
+        guard item.canUpdate, item.state == .available, !isActive(item), confirmQuit([item]) else { return }
         enqueue([(item, .update)])
     }
 
