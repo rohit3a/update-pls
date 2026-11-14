@@ -981,10 +981,15 @@ extension Engine {
             message += " (allow Update pls in System Settings › Privacy & Security › App Management)"
         } else if message.lowercased().contains("unauthenticated") {
             // Cursor Agent's own updater refuses to run until you sign in on that machine.
-            message += " (sign in to it on that machine first, then press Retry)"
+            message = String(message.prefix(200)) + " (\(signInHint), then press Retry)"
         }
         return message.count > 360 ? String(message.prefix(360)) + "…" : message
     }
+
+    static let signInHint = "sign in to it on that machine first"
+
+    /// Whether a failure only means the tool wants someone to sign in to it first.
+    static func needsSignIn(_ message: String) -> Bool { message.contains(signInHint) }
 
     static func isProgressBar(_ line: String) -> Bool {
         !line.isEmpty && line.range(of: #"^[#=O\- ]*(\d{1,3}(\.\d+)?%)?$"#, options: .regularExpression) != nil

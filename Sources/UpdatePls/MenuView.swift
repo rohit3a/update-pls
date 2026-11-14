@@ -186,9 +186,18 @@ struct ItemRow: View {
         case .queued?:
             Text(model.queuedMessage(item)).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
         case let .running(phase, fraction)?:
-            Text(fraction.map { "\(phase) · \(Int($0 * 100))%" } ?? (phase.hasSuffix(".") ? phase : "\(phase)…"))
-                .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-                .contentTransition(.opacity)
+            // The time stays visible however long the step is, so a slow download never looks frozen.
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                HStack(spacing: 0) {
+                    Text(fraction.map { "\(phase) · \(Int($0 * 100))%" } ?? (phase.hasSuffix(".") ? phase : "\(phase)…"))
+                        .lineLimit(1).truncationMode(.tail)
+                        .contentTransition(.opacity)
+                    if let t = Self.timing(model.runTimes(item, now: ctx.date)) {
+                        Text(t).monospacedDigit().fixedSize()
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
         case let .checking(msg)?:
             Text("\(msg) · checking…").font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
         case let .done(msg)?:
@@ -199,6 +208,14 @@ struct ItemRow: View {
         case nil:
             Text(versionText).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
         }
+    }
+
+    /// " · 1:05" once a job has run 10 seconds, and " · 2:40, quiet 1:50" when nothing has moved for 45 seconds
+    /// (npm and Homebrew print nothing while they download).
+    static func timing(_ t: (elapsed: TimeInterval, quiet: TimeInterval)?) -> String? {
+        guard let t, t.elapsed >= 10 else { return nil }
+        func clock(_ s: TimeInterval) -> String { String(format: "%d:%02d", Int(s) / 60, Int(s) % 60) }
+        return " · " + clock(t.elapsed) + (t.quiet >= 45 ? ", quiet \(clock(t.quiet))" : "")
     }
 
     /// For long versions, only the part that changed: 0.1.1-nightly.20261019.3360 → 3373.
@@ -267,7 +284,9 @@ struct ItemRow: View {
     var versionText: String {
         let installed = item.installed ?? "?"
         guard let latest = item.latest?.version else { return "\(installed) · latest unknown" }
-        return item.state == .available ? "\(installed) → \(Self.changedPart(of: latest, from: installed))" : "\(installed) · latest"
+        guard item.state == .available else { return "\(installed) · latest" }
+        let text = "\(installed) → \(Self.changedPart(of: latest, from: installed))"
+        return model.waitingForSignIn.contains(item.key) ? text + " · sign in to update" : text
     }
 
     @ViewBuilder var action: some View {

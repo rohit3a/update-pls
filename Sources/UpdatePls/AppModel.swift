@@ -73,10 +73,20 @@ final class AppModel: ObservableObject {
 
     private var scheduler: NSBackgroundActivityScheduler?
     private var notified: Set<String>
-    /// Jobs waiting, per machine. Each machine runs one job at a time (package managers lock); machines run in parallel.
+    /// Jobs waiting, per machine, in the order they were queued. Each machine works through them in lanes
+    /// (see `lane(_:)`): one job at a time per lane, lanes and machines in parallel.
     private var pending: [Machine: [(Item, Job)]] = [:]
-    /// Machines with jobs running or being re-checked. The Mac stays awake while there are any.
-    @Published private var workers: Set<Machine> = [] {
+    struct Lane: Hashable { let machine: Machine; let name: String }
+    /// When each running job started and last showed progress, by item key.
+    private var runStarted: [String: Date] = [:]
+    private var lastProgress: [String: Date] = [:]
+    /// Tools whose updater refused to run until someone signs in to it (Cursor Agent). Update all leaves them
+    /// out, so they don't fail every time, until they update.
+    @Published var waitingForSignIn: Set<String> {
+        didSet { UserDefaults.standard.set(Array(waitingForSignIn), forKey: "waitingForSignIn") }
+    }
+    /// Lanes with jobs running or being re-checked. The Mac stays awake while there are any.
+    @Published private var workers: Set<Lane> = [] {
         didSet {
             if workers.isEmpty { KeepAwake.end(awake); awake = nil } else if awake == nil { awake = KeepAwake.begin("Updating tools") }
         }
@@ -96,6 +106,7 @@ final class AppModel: ObservableObject {
         excluded = Set(UserDefaults.standard.stringArray(forKey: "excludedFromUpdateAll") ?? [])
         hidden = Set(UserDefaults.standard.stringArray(forKey: "hiddenTools") ?? [])
         previous = UserDefaults.standard.dictionary(forKey: "previousVersions") as? [String: String] ?? [:]
+        waitingForSignIn = Set(UserDefaults.standard.stringArray(forKey: "waitingForSignIn") ?? [])
         notified = Set(UserDefaults.standard.stringArray(forKey: "notifiedUpdates") ?? [])
         askBeforeQuitting = !UserDefaults.standard.bool(forKey: "dontAskBeforeQuitting")
         let h = UserDefaults.standard.double(forKey: "intervalHours")
@@ -124,7 +135,8 @@ final class AppModel: ObservableObject {
     /// Updates waiting: shown on the icon and in Update all.
     var pendingUpdates: [Item] {
         let on = Set(machines)
-        return items.filter { on.contains($0.machine) && $0.state == .available && $0.canUpdate && !excluded.contains($0.key) && !hidden.contains($0.key) }
+        return items.filter { on.contains($0.machine) && $0.state == .available && $0.canUpdate && !excluded.contains($0.key)
+            && !hidden.contains($0.key) && !waitingForSignIn.contains($0.key) }
     }
 
     /// What Update all would start now (leaves out anything already queued or running).
@@ -245,8 +257,17 @@ final class AppModel: ObservableObject {
                 found[i].state = Engine.state(found[i])
             }
         }
+        // Jobs in other lanes may still be running on this machine: their rows keep what they showed before,
+        // since a read taken mid-update (an app moved aside for its swap) isn't the tool's real state.
+        let running = items.filter { i in
+            if i.machine == m, case .running? = activity[i.key] { true } else { false }
+        }
+        found.removeAll { f in running.contains { $0.key == f.key } }
         items.removeAll { $0.machine == m }
-        items.append(contentsOf: found)
+        items.append(contentsOf: found + running)
+        // Signed in and updated some other way: back in Update all.
+        let current = Set(found.filter { $0.state != .available }.map(\.key))
+        if !waitingForSignIn.isDisjoint(with: current) { waitingForSignIn.subtract(current) }
     }
 
     // MARK: Updating
@@ -289,15 +310,17 @@ final class AppModel: ObservableObject {
 
     func dismiss(_ item: Item) { if !isActive(item) { activity[item.key] = nil } }
 
-    /// What a queued job is waiting for: a check of its machine, or the job running there (one at a time per machine).
+    /// What a queued job is waiting for: a check of its machine, or the job running in its lane there.
     func queuedMessage(_ item: Item) -> String {
         if scanning.contains(item.machine) { return "Waiting for the check to finish…" }
-        for other in items where other.machine == item.machine && other.key != item.key {
-            switch activity[other.key] {
-            case .running?: return "Waiting for \(other.name) to finish…"
-            case .checking?: return "Waiting for the version check…"
-            default: continue
-            }
+        let lane = Self.lane(item)
+        let others = items.filter { $0.machine == item.machine && $0.key != item.key && Self.lane($0) == lane }
+        // Name the job actually running first; a finished one being confirmed only takes a few seconds.
+        if let busy = others.first(where: { if case .running? = activity[$0.key] { true } else { false } }) {
+            return "Waiting for \(busy.name) to finish…"
+        }
+        if others.contains(where: { if case .checking? = activity[$0.key] { true } else { false } }) {
+            return "Waiting for the version check…"
         }
         return "Waiting to update…"
     }
@@ -325,32 +348,64 @@ final class AppModel: ObservableObject {
             activity[item.key] = .queued
             pending[item.machine, default: []].append((item, job))
         }
-        for m in Set(fresh.map(\.0.machine)) where !workers.contains(m) {
-            workers.insert(m)
-            Task { await drain(m) }
+        for m in Set(fresh.map(\.0.machine)) { startLanes(m) }
+    }
+
+    /// Which jobs may run side by side on one machine. Jobs in the same lane run one at a time: one package
+    /// manager (npm, Homebrew, apt, ...) never runs twice at once, and Mac app downloads go one by one.
+    /// A tool's own updater only touches that tool, so each gets its own lane.
+    nonisolated static func lane(_ item: Item) -> String {
+        switch item.method {
+        case .npm: "npm"
+        case .bun: "bun"
+        case .brewFormula, .cask: "brew"
+        case .pipx: "pipx"
+        case .uv: "uv"
+        case .selfUpdate: "self:\(item.defID)"
+        case .macDirect: "apps"
+        case .winget: "winget"
+        case .deb: "apt"
+        case .none: "manual"
         }
     }
 
-    private func drain(_ m: Machine) async {
-        while scanning.contains(m) { try? await Task.sleep(for: .milliseconds(200)) }
-        while let first = pending[m]?.first {
-            var done: [(Item, Job, UpdateOutcome)] = []
-            var next: (Item, Job)? = first
-            while let (item, job) = next {
-                pending[m]?.removeFirst()
-                done.append((item, job, await run(item, job)))
-                next = pending[m]?.first
-            }
-            await verify(m, done)
+    /// At most this many jobs at once on one machine (also keeps SSH connections to a server few).
+    nonisolated static let maxLanes = 4
+
+    /// Starts a worker for each lane that has queued jobs on this machine, in queue order, up to `maxLanes`.
+    private func startLanes(_ m: Machine) {
+        var lanes: [String] = []
+        for (item, _) in pending[m] ?? [] where !lanes.contains(Self.lane(item)) { lanes.append(Self.lane(item)) }
+        for name in lanes {
+            let lane = Lane(machine: m, name: name)
+            guard !workers.contains(lane) else { continue }
+            guard workers.filter({ $0.machine == m }).count < Self.maxLanes else { return }
+            workers.insert(lane)
+            Task { await drain(lane) }
         }
-        pending[m] = nil
-        workers.remove(m)
+    }
+
+    private func drain(_ lane: Lane) async {
+        let m = lane.machine
+        while scanning.contains(m) { try? await Task.sleep(for: .milliseconds(200)) }
+        // Each job is confirmed as soon as it ends, so one slow update never leaves the others at "checking…".
+        while let i = pending[m]?.firstIndex(where: { Self.lane($0.0) == lane.name }) {
+            let (item, job) = pending[m]!.remove(at: i)
+            let outcome = await run(item, job)
+            await verify(m, [(item, job, outcome)])
+        }
+        if pending[m]?.isEmpty == true { pending[m] = nil }
+        workers.remove(lane)
+        // A lane that was waiting for a free slot can start now.
+        startLanes(m)
         if workers.isEmpty { finishBatch() }
     }
 
     private func run(_ item: Item, _ job: Job) async -> UpdateOutcome {
         let key = item.key
         activity[key] = .running("Starting", nil)
+        runStarted[key] = Date()
+        lastProgress[key] = Date()
         lastJob[key] = job
         let what = if case let .install(v, source) = job { "switch to \(v) (\(source == .saved ? "saved copy" : "published"))" } else { "update \(item.summary)" }
         let file = Log.newRun(key)
@@ -360,12 +415,27 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self, case .running = self.activity[key] else { return }
                 self.activity[key] = .running(text, fraction)
+                self.lastProgress[key] = Date()
             }
         }
         let outcome = await perform(item, job, reporter)
         Log.appendRun(file, "\n\(Log.stamp()) \(outcome.ok ? "Done" : "FAILED"): \(outcome.message)\n")
         activity[key] = outcome.ok ? .checking(outcome.message) : .failed(outcome.message)
+        runStarted[key] = nil
+        lastProgress[key] = nil
+        if !outcome.ok && Engine.needsSignIn(outcome.message) {
+            // Update all skips it until it's signed in; its own Update/Retry button still runs it.
+            if waitingForSignIn.insert(key).inserted { Log.info("\(key): needs a sign-in, left out of Update all until it updates") }
+        } else if outcome.ok {
+            waitingForSignIn.remove(key)
+        }
         return outcome
+    }
+
+    /// How long a running job has taken, and how long since it last showed any progress (for the menu row).
+    func runTimes(_ item: Item, now: Date = Date()) -> (elapsed: TimeInterval, quiet: TimeInterval)? {
+        guard let start = runStarted[item.key] else { return nil }
+        return (now.timeIntervalSince(start), now.timeIntervalSince(lastProgress[item.key] ?? start))
     }
 
     /// Re-reads the machine once its queue is empty and confirms each job by its installed version. Only then

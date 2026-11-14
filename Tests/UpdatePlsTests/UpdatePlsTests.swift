@@ -905,6 +905,119 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(model.activity[b.key], .failed("Still on 1.0 after updating. Updated"))
     }
 
+    /// A slow job (a stalled download) must not leave the jobs before it at "checking…" until it ends.
+    @MainActor
+    func testEachJobIsConfirmedWithoutWaitingForTheQueue() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let previous = UserDefaults.standard.object(forKey: "previousVersions")
+        defer { UserDefaults.standard.set(previous, forKey: "previousVersions") }
+        let model = AppModel(autostart: false)
+        var a = Item(machine: .local, os: .mac, defID: "a", name: "A", brand: "A", isApp: false, path: "/a",
+                     installed: "1.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "a"))
+        a.state = .available
+        var b = a; b.defID = "b"; b.name = "B"; b.path = "/b"
+        var c = a; c.defID = "c"; c.name = "C"; c.path = "/c"
+        model.items = [a, b, c]
+        model.perform = { item, _, _ in
+            try? await Task.sleep(for: .milliseconds(item.defID == "b" ? 1500 : 50))
+            return UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
+        }
+        var a2 = a; a2.installed = "2.0"; a2.state = .upToDate
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), m.isLocal ? [a2, b, c] : []) }
+        model.enqueue([(a, .update), (b, .update), (c, .update)])
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(model.activity[a.key], .done("Updated to 2.0"), "A is confirmed while B is still running")
+        XCTAssertEqual(model.queuedMessage(c), "Waiting for B to finish…", "C names the job it really waits for")
+        for _ in 0..<60 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertFalse(model.isBusy)
+    }
+
+    /// Different package managers on one machine run side by side; the same one never runs twice at once.
+    @MainActor
+    func testLanesRunDifferentInstallersTogether() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let previous = UserDefaults.standard.object(forKey: "previousVersions")
+        defer { UserDefaults.standard.set(previous, forKey: "previousVersions") }
+        let model = AppModel(autostart: false)
+        func item(_ id: String, _ method: UpdatePls.Method) -> Item {
+            var i = Item(machine: .local, os: .mac, defID: id, name: id.uppercased(), brand: id, isApp: false, path: "/\(id)",
+                         installed: "1.0", latest: LatestInfo(version: "2.0"), method: method)
+            i.state = .available
+            return i
+        }
+        let n1 = item("n1", .npm(bin: "/n1", prefix: "/p", package: "n1", tag: "latest", writable: true))
+        let n2 = item("n2", .npm(bin: "/n2", prefix: "/p", package: "n2", tag: "latest", writable: true))
+        let app = item("app", .macDirect(appPath: "/Applications/App.app", bundleID: "x.app"))
+        let own = item("own", .selfUpdate(path: "/own", args: "update"))
+        model.items = [n1, n2, app, own]
+        let running = Box(Set<String>()), maxTogether = Box(0), npmTogether = Box(0)
+        model.perform = { item, _, _ in
+            running.mutate { $0.insert(item.defID) }
+            let now = running.value
+            maxTogether.mutate { $0 = max($0, now.count) }
+            npmTogether.mutate { $0 = max($0, now.filter { $0.hasPrefix("n") }.count) }
+            try? await Task.sleep(for: .milliseconds(300))
+            running.mutate { $0.remove(item.defID) }
+            return UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
+        }
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), []) }
+        let start = Date()
+        model.enqueue([(n1, .update), (n2, .update), (app, .update), (own, .update)])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.queuedMessage(n2), "Waiting for N1 to finish…", "a queued row names the job in its own lane")
+        for _ in 0..<60 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(maxTogether.value, 3, "npm, the app download and the tool's own updater run at once")
+        XCTAssertEqual(npmTogether.value, 1, "npm never runs twice at once")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.0, "two rounds of 300 ms, not four")
+        XCTAssertEqual(AppModel.lane(n1), AppModel.lane(n2))
+        XCTAssertNotEqual(AppModel.lane(own), AppModel.lane(item("own2", .selfUpdate(path: "/own2", args: "update"))))
+    }
+
+    /// A tool that wants a sign-in first is left out of Update all, so it doesn't fail every time, until it updates.
+    @MainActor
+    func testSignInFailuresAreHeldOutOfUpdateAll() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let before = UserDefaults.standard.object(forKey: "waitingForSignIn")
+        defer { UserDefaults.standard.set(before, forKey: "waitingForSignIn") }
+        UserDefaults.standard.removeObject(forKey: "waitingForSignIn")
+        let model = AppModel(autostart: false)
+        var a = Item(machine: .local, os: .mac, defID: "cursor-agent", name: "Cursor Agent", brand: "Cursor", isApp: false, path: "/a",
+                     installed: "1.0", latest: LatestInfo(version: "2.0"), method: .selfUpdate(path: "/a", args: "update"))
+        a.state = .available
+        model.items = [a]
+        let signedIn = Box(false)
+        model.perform = { _, _, _ in
+            signedIn.value ? UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
+                : .fail(Engine.failure(ShellResult(status: 1, stdout: "", stderr: "Error: Update failed: [unauthenticated] Error")))
+        }
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [a]) }
+        XCTAssertEqual(model.pendingUpdates.map(\.key), [a.key])
+        model.updateAll()
+        for _ in 0..<40 where model.isBusy { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(model.waitingForSignIn.contains(a.key))
+        XCTAssertTrue(model.pendingUpdates.isEmpty, "not in Update all or the icon's count")
+        XCTAssertEqual(AppModel(autostart: false).waitingForSignIn, [a.key], "remembered after a restart")
+        // Its own button still runs it; once it works it's back in Update all.
+        signedIn.mutate { $0 = true }
+        model.update(a)
+        for _ in 0..<40 where model.isBusy { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(model.waitingForSignIn.isEmpty)
+    }
+
+    func testRunningRowShowsTimeAndQuietSpells() {
+        XCTAssertNil(ItemRow.timing(nil))
+        XCTAssertNil(ItemRow.timing((elapsed: 9, quiet: 9)), "short steps show no clock")
+        XCTAssertEqual(ItemRow.timing((elapsed: 65, quiet: 20)), " · 1:05")
+        XCTAssertEqual(ItemRow.timing((elapsed: 160, quiet: 110)), " · 2:40, quiet 1:50")
+    }
+
     /// Runs Update all through the menu's own model on this Mac's real apps, pressing the buttons again
     /// throughout, and prints every row change. It really updates them, so only with UPDATEPLS_LIVE_UPDATE=1.
     /// Anything from Claude is left alone.

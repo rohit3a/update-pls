@@ -49,6 +49,18 @@ enum Probe {
     }
     UP_P=$(up_login_path | sed -n 's/^__UPP__//p' | tail -1)
     export PATH="${UP_P:+$UP_P:}$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+    # Homebrew's curl has no stall limit, so one frozen download held a machine's whole queue for up to 30 minutes.
+    # Abort a download that moves under 1 KB/s for 60 seconds; brew's curl then retries and resumes it.
+    # The config file lives only while brew runs, and brew runs as before if there's nowhere to write it.
+    if command -v brew >/dev/null 2>&1 && [ -z "${HOMEBREW_CURLRC:-}" ]; then
+      brew() {
+        up_rc=$(mktemp 2>/dev/null) || { command brew "$@"; return; }
+        printf 'speed-limit = 1024\nspeed-time = 60\n' > "$up_rc"
+        if HOMEBREW_CURLRC="$up_rc" command brew "$@"; then up_r=0; else up_r=$?; fi
+        rm -f "$up_rc"
+        return $up_r
+      }
+    fi
     # macOS has no `timeout`: there the command is stopped by a sleeper instead, so nothing can hang a check.
     up_to() {
       t=$1; shift
