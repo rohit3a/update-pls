@@ -349,9 +349,14 @@ struct SettingsView: View {
             Section("Machines (from ~/.ssh/config)") {
                 if model.hosts.isEmpty { Text("No SSH hosts found").foregroundStyle(.secondary) }
                 ForEach(model.hosts, id: \.self) { h in
-                    Toggle(h, isOn: Binding(
+                    Toggle(isOn: Binding(
                         get: { !model.disabledHosts.contains(h) },
-                        set: { on in if on { model.disabledHosts.remove(h) } else { model.disabledHosts.insert(h) } }))
+                        set: { on in if on { model.disabledHosts.remove(h) } else { model.disabledHosts.insert(h) } })) {
+                        Text(h)
+                        if let other = model.sameMachine(as: h) {
+                            Text("Same machine as \(other)\(model.disabledHosts.contains(h) ? "" : ", used if \(other) can't connect")")
+                        }
+                    }
                 }
             }
             if !model.hidden.isEmpty {

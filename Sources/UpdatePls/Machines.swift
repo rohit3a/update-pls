@@ -5,8 +5,14 @@ enum OSKind: String { case mac, linux, windows }
 struct Machine: Identifiable, Hashable {
     let id: String
     let name: String
+    /// Other ~/.ssh/config aliases that reach the same machine, tried in order when `id` can't run commands there.
+    var fallbacks: [String] = []
     var isLocal: Bool { id == Machine.local.id }
     static let local = Machine(id: "local", name: Host.current().localizedName ?? "This Mac")
+
+    // One machine is one alias, whatever its fallbacks.
+    static func == (a: Machine, b: Machine) -> Bool { a.id == b.id }
+    func hash(into h: inout Hasher) { h.combine(id) }
 }
 
 enum SSHConfig {
@@ -25,6 +31,53 @@ enum SSHConfig {
             }
         }
         return out
+    }
+
+    /// Where an alias really connects, "user@host:port", as `ssh -G` works it out from the whole config.
+    static func target(_ alias: String) -> String? {
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-G", alias]
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        var f: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            if parts.count == 2, ["hostname", "user", "port"].contains(parts[0]) { f[parts[0]] = parts[1] }
+        }
+        guard let host = f["hostname"] else { return nil }
+        return "\(f["user"] ?? "")@\(host.lowercased()):\(f["port"] ?? "22")"
+    }
+
+    static func targets(_ aliases: [String]) -> [String: String] {
+        var t: [String: String] = [:]
+        for a in aliases { t[a] = target(a) ?? a }
+        return t
+    }
+
+    /// The alias that last worked for each target, so a check starts with it.
+    static var preferred: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "preferredHosts") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "preferredHosts") }
+    }
+
+    /// One machine per place the turned-on aliases reach, in config order. Each uses the alias that last worked
+    /// there, else the first one; the other aliases for it become its fallbacks.
+    static func machines(hosts: [String], disabled: Set<String>, targets: [String: String], preferred: [String: String]) -> [Machine] {
+        var order: [String] = [], groups: [String: [String]] = [:]
+        for h in hosts where !disabled.contains(h) {
+            let t = targets[h] ?? h
+            if groups[t] == nil { order.append(t) }
+            groups[t, default: []].append(h)
+        }
+        return order.map { t in
+            let aliases = groups[t]!
+            let primary = preferred[t].flatMap { aliases.contains($0) ? $0 : nil } ?? aliases[0]
+            return Machine(id: primary, name: primary, fallbacks: aliases.filter { $0 != primary })
+        }
     }
 }
 

@@ -163,13 +163,37 @@ enum Engine {
             Log.info("check \(m.id): \(what): \(msg); trying again")
             scan = await self.scan(m, catalog)
         }
+        // This alias reaches the machine but can't run the check there (a key limited to one program, or refused):
+        // try the other aliases for the same machine, and start with the one that works next time.
+        func viaOtherAlias(_ msg: String) async -> (MachineStatus, [Item])? {
+            for (k, alias) in m.fallbacks.enumerated() {
+                Log.info("check \(m.id): \(msg); trying \(alias), the same machine")
+                let alt = Machine(id: alias, name: alias, fallbacks: Array(m.fallbacks.dropFirst(k + 1)))
+                let r = await check(alt, catalog: catalog, resolver: resolver, known: known)
+                if case .online = r.0.state {
+                    if let t = SSHConfig.target(alias) { SSHConfig.preferred[t] = alias }
+                    return r
+                }
+                if !alt.fallbacks.isEmpty { break } // that check already tried the rest
+            }
+            return nil
+        }
         let os: OSKind, out: ShellResult
         switch scan {
         case let .failed(what, msg, _):
+            if msg.hasPrefix("Couldn't tell what system this is") || msg.contains("Permission denied"), let r = await viaOtherAlias(msg) { return r }
             status.state = .offline(msg)
             Log.error("check \(m.id): \(what): \(msg)")
             return (status, [])
         case let .done(o, r): (os, out) = (o, r)
+        }
+        // Every check prints an OS line first: without one the script never ran (the key only allows one command).
+        if !out.stdout.contains("OS\t") {
+            let msg = "Connected, but this key can't run the check there (it may be limited to one command)"
+            if let r = await viaOtherAlias(msg) { return r }
+            status.state = .offline(msg)
+            Log.error("check \(m.id): \(msg)" + (out.combined.isEmpty ? "" : "\n" + out.combined.trimmingCharacters(in: .whitespacesAndNewlines)))
+            return (status, [])
         }
         status.os = os
         if let full = out.stderr.split(separator: "\n").first(where: { $0.contains("Disk quota exceeded") || $0.contains("No space left on device") }) {

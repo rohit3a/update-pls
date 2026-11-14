@@ -1036,6 +1036,27 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(runs.value, 1)
     }
 
+    /// Aliases that reach the same machine (one per key, say) show as one machine with the others as fallbacks.
+    func testSSHAliasesForOneMachineShowAsOne() {
+        let hosts = ["old-mac", "rog-clipbubble", "rog-t3", "rog-workstation", "pi"]
+        let targets = ["old-mac": "rohit@100.87.144.62:22", "rog-clipbubble": "rohit@100.104.83.65:22", "rog-t3": "rohit@100.104.83.65:22",
+                       "rog-workstation": "rohit@100.104.83.65:22", "pi": "pi@100.104.83.65:22"]
+        // Nothing preferred yet: the first turned-on alias leads, the rest are fallbacks; another user is another machine.
+        var m = SSHConfig.machines(hosts: hosts, disabled: ["old-mac"], targets: targets, preferred: [:])
+        XCTAssertEqual(m.map(\.id), ["rog-clipbubble", "pi"])
+        XCTAssertEqual(m[0].fallbacks, ["rog-t3", "rog-workstation"])
+        // The alias that worked last leads.
+        m = SSHConfig.machines(hosts: hosts, disabled: [], targets: targets, preferred: ["rohit@100.104.83.65:22": "rog-workstation"])
+        XCTAssertEqual(m.map(\.id), ["old-mac", "rog-workstation", "pi"])
+        XCTAssertEqual(m[1].fallbacks, ["rog-clipbubble", "rog-t3"])
+        // An alias turned off is never used, preferred or not.
+        m = SSHConfig.machines(hosts: hosts, disabled: ["rog-workstation", "rog-clipbubble"], targets: targets, preferred: ["rohit@100.104.83.65:22": "rog-workstation"])
+        XCTAssertEqual(m.map(\.id), ["old-mac", "rog-t3", "pi"])
+        XCTAssertEqual(m[1].fallbacks, [])
+        // Machines are told apart by alias only.
+        XCTAssertEqual(Machine(id: "a", name: "a", fallbacks: ["b"]), Machine(id: "a", name: "a"))
+    }
+
     func testRunningRowShowsTimeAndQuietSpells() {
         XCTAssertNil(ItemRow.timing(nil))
         XCTAssertNil(ItemRow.timing((elapsed: 9, quiet: 9)), "short steps show no clock")

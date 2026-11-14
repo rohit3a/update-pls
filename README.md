@@ -49,7 +49,7 @@ The download is checked while the app keeps running, so it is closed only for th
 
 Many apps also update themselves (Squirrel's ShipIt, Sparkle, electron-updater). If an app has already downloaded the new version in the background, Update pls uses that copy instead of downloading it again, after the same signature, Gatekeeper and team checks (and the published hash, for electron-updater's zip). Update pls checks the installed version before it downloads, again after the download, and after the app quits, and waits for the app's own updater to finish if quitting sets it off. If the app is already on the new version, it isn't replaced or restarted a second time. The version its own updater replaced is still kept for rollback: the app is cloned just before it quits (instant and free on APFS), and if that copy can't be made, the app isn't quit or updated. If its own updater is still running after 5 minutes, the update stops there rather than replacing the app under it. If anything fails after the app was quit, the old version stays in place and the app is reopened.
 
-Nothing is installed on your other machines. Checks and updates run over your existing SSH config with `BatchMode`, so password prompts are never answered.
+Nothing is installed on your other machines. Checks and updates run over your existing SSH config with `BatchMode`, so password prompts are never answered. Aliases that reach the same machine (one per key, say) show as one machine; if an alias's key can't run commands there, the next alias for that machine is used and remembered.
 
 ## Install
 

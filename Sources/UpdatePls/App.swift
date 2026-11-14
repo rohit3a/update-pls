@@ -97,8 +97,9 @@ enum CLI {
 
     static func machines(_ names: [String]) -> [Machine] {
         let disabled = Set(UserDefaults.standard.stringArray(forKey: "disabledHosts") ?? [])
-        let all = [Machine.local] + SSHConfig.hosts().filter { !disabled.contains($0) }.map { Machine(id: $0, name: $0) }
-        return names.isEmpty ? all : all.filter { names.contains($0.id) }
+        let hosts = SSHConfig.hosts()
+        let all = [Machine.local] + SSHConfig.machines(hosts: hosts, disabled: disabled, targets: SSHConfig.targets(hosts), preferred: SSHConfig.preferred)
+        return names.isEmpty ? all : all.filter { m in names.contains(m.id) || m.fallbacks.contains { names.contains($0) } }
     }
 
     static func checkAll(_ machines: [Machine]) async -> [(MachineStatus, [Item])] {

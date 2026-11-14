@@ -30,7 +30,11 @@ final class AppModel: ObservableObject {
     @Published var selfLatest: String?
     @Published var selfUpdating = false
     @Published var selfError: String?
-    @Published var hosts: [String] = SSHConfig.hosts()
+    @Published var hosts: [String] = SSHConfig.hosts() {
+        didSet { if hosts != oldValue { hostTargets = SSHConfig.targets(hosts) } }
+    }
+    /// Where each alias connects ("user@host:port"), so aliases for one machine show as one.
+    private(set) var hostTargets: [String: String] = SSHConfig.targets(SSHConfig.hosts())
     /// Update progress and results by item key.
     @Published var activity: [String: Activity] = [:]
     /// Each tool's last update output, by item key.
@@ -129,7 +133,7 @@ final class AppModel: ObservableObject {
     }
 
     var machines: [Machine] {
-        [Machine.local] + hosts.filter { !disabledHosts.contains($0) }.map { Machine(id: $0, name: $0) }
+        [Machine.local] + SSHConfig.machines(hosts: hosts, disabled: disabledHosts, targets: hostTargets, preferred: SSHConfig.preferred)
     }
 
     /// Updates waiting: shown on the icon and in Update all.
@@ -150,6 +154,12 @@ final class AppModel: ObservableObject {
     func label(forKey key: String) -> String {
         guard let i = items.first(where: { $0.key == key }) else { return key }
         return i.machine.isLocal ? i.name : "\(i.name) on \(i.machine.name)"
+    }
+
+    /// For Settings: the machine this alias is shown under, when that's another alias for the same machine.
+    func sameMachine(as alias: String) -> String? {
+        guard let t = hostTargets[alias] else { return nil }
+        return machines.first { $0.id != alias && !$0.isLocal && hostTargets[$0.id] == t }?.id
     }
 
     func toggleExcluded(_ item: Item) {
@@ -222,7 +232,10 @@ final class AppModel: ObservableObject {
             }
         }
         scanning = []
-        items.removeAll { item in !machines.contains(item.machine) }
+        // A check that fell back to another alias for the same machine lists it under that alias from now on.
+        let current = machines
+        statuses.removeAll { !current.contains($0.machine) }
+        items.removeAll { item in !current.contains(item.machine) }
         if History.migrateVariantKeys(items) {
             previous = History.previous
             excluded = History.excluded
