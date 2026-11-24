@@ -15,6 +15,8 @@ struct UpdateOutcome {
     var changed = true
     var timedOut = false
     var cancelled = false
+    /// Something to add to whatever the result finally says (an app that couldn't be reopened).
+    var note: String?
 
     static func fail(_ message: String, output: String = "") -> UpdateOutcome { UpdateOutcome(ok: false, message: message, output: output) }
     static func cancelledOutcome(output: String = "") -> UpdateOutcome {
@@ -428,6 +430,12 @@ extension Engine {
     /// `version` is the one switched to (nil for an update); `fresh` is the tool as scanned again, nil if it
     /// couldn't be read (then the job's own result stands).
     static func confirm(_ item: Item, switchedTo version: String?, _ o: UpdateOutcome, fresh: Item?, offline: Bool) -> (ok: Bool, message: String) {
+        let r = confirmed(item, switchedTo: version, o, fresh: fresh, offline: offline)
+        guard let note = o.note, !r.message.contains(note) else { return r }
+        return (r.ok, r.message + " (\(note))")
+    }
+
+    private static func confirmed(_ item: Item, switchedTo version: String?, _ o: UpdateOutcome, fresh: Item?, offline: Bool) -> (ok: Bool, message: String) {
         guard o.ok else { return (false, o.message) }
         if offline { return (true, o.message + " (machine went offline before it could be re-checked)") }
         guard let fresh, let now = fresh.installed, !now.isEmpty else {
@@ -638,6 +646,7 @@ extension Engine {
           if [ "$(defaults read "$up_t/Contents/Info" CFBundleShortVersionString 2>/dev/null)" != "$(defaults read "$up_k/Contents/Info" CFBundleShortVersionString 2>/dev/null)" ]; then rm -rf "$up_t"; return 1; fi
           if codesign --verify --strict "$up_k" >/dev/null 2>&1 && ! codesign --verify --deep --strict "$up_t" >/dev/null 2>&1; then rm -rf "$up_t"; return 1; fi
           rm -rf "$up_f"
+          if [ -e "$up_f" ] || [ -L "$up_f" ]; then rm -rf "$up_t"; return 1; fi
           if ! mv "$up_t" "$up_f"; then rm -rf "$up_t"; return 1; fi
           rm -rf "$up_k"
           return 0
@@ -655,7 +664,9 @@ extension Engine {
     static let macRecoverBody = fileOldFunction + """
         if [ -f "$MARK" ]; then
           A=$(sed -n 1p "$MARK"); K=$(sed -n 2p "$MARK"); F=$(sed -n 4p "$MARK"); back=1
-          if [ -n "$F" ]; then
+          if [ -z "$A" ] || [ -z "$K" ]; then
+            back=0; echo "RECOVER_FAILED	$MARK"
+          elif [ -n "$F" ]; then
             if [ -d "$K" ] && [ ! -L "$K" ]; then
               if up_file_old "$K" "$F"; then echo "FILED	$F"; else back=0; echo "FILE_FAILED	$K"; fi
             fi
@@ -841,6 +852,11 @@ extension Engine {
           fi
           sleep 0.5
         done
+        # The deadline may fall inside the final quiet spell: give that spell its last few seconds.
+        for i in 1 2 3 4 5 6 7 8; do
+          if [ $idle -ge 8 ] || updater_running; then break; fi
+          idle=$((idle + 1)); sleep 0.5
+        done
         if [ $idle -lt 8 ]; then
           echo "UPDATER_BUSY	1"
           up_fail \(Shell.q("\(name) is still installing its own update. Let it finish, then press Retry."))
@@ -870,7 +886,7 @@ extension Engine {
             [ "$(defaults read "$NEW/Contents/Info" CFBundleIdentifier)" = "$BID" ] || up_fail "The saved copy is a different app"
             \(trust ? #"codesign --verify --deep --strict "$NEW" || up_fail "The saved copy's signature is broken""# : "")
             """
-        return macHeader(app: app, bundleID: bundleID) + fileOldFunction + keepPreFunction + """
+        return macHeader(app: app, bundleID: bundleID) + fileOldFunction + keepPreFunction + svSafeFunction + """
         SV="$HOME/"\(Shell.q(saved)); ST="$HOME/"\(Shell.q(stage)); AN=\(Shell.q(appName)); WANT=\(Shell.q(version))
         up_step \(Shell.q("Installing \(name) \(version)"))
         \(source)
@@ -885,6 +901,7 @@ extension Engine {
           up_step \(Shell.q("Copying \(name) \(version) next to the installed app"))
           TMPNEW="$DEST/.$AN.update-pls-new"
           rm -rf "$TMPNEW"
+          if [ -e "$TMPNEW" ]; then up_fail "Couldn't clear $TMPNEW"; fi
           ditto "$NEW" "$TMPNEW" || up_fail "Couldn't copy \(name) $WANT to $DEST"
           \(trust ? #"codesign --verify --deep --strict "$TMPNEW" || up_fail "The copy next to the app has a broken signature""# : "")
           [ "$(defaults read "$TMPNEW/Contents/Info" CFBundleIdentifier 2>/dev/null)" = "$BID" ] || up_fail "The copy next to the app is a different app"
@@ -902,13 +919,16 @@ extension Engine {
         if [ \(forward ? 1 : 0) = 1 ] && [ -z "$CUR" ]; then up_fail "Couldn't read which version of \(name) is installed, so nothing was replaced"; fi
         up_stop_shipit
         mkdir -p "$SV"
+        up_sv_safe || up_fail "The folder for \(name)'s saved versions is a link to somewhere else; nothing was replaced"
         # Copies saved by Update pls 0.3 sit directly in the folder; file them under their version.
         if [ -d "$SV/$AN" ] && [ ! -L "$SV/$AN" ] && [ "$NEW" != "$SV/$AN" ]; then
           old=$(defaults read "$SV/$AN/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo unknown)
           rm -rf "$SV/$old/$AN"; mkdir -p "$SV/$old"; mv "$SV/$AN" "$SV/$old/$AN"
         fi
         KEEP="$SV/${CUR:-unknown}"
+        if [ -L "$KEEP" ]; then rm -f "$KEEP"; fi
         rm -rf "$KEEP/$AN"; mkdir -p "$KEEP"
+        if [ -e "$KEEP/$AN" ] || [ -L "$KEEP/$AN" ]; then up_fail "Couldn't clear $KEEP/$AN to save the current version there"; fi
         if [ "$(dev "$KEEP")" = "$(dev "$DEST")" ]; then
           OLD="$KEEP/$AN"
         else
@@ -916,9 +936,13 @@ extension Engine {
           OLD="$DEST/.$AN.update-pls-old"
           if [ -e "$OLD" ]; then up_fail "\(name)'s previous version from an earlier update is still waiting to be saved at $OLD; move it somewhere safe or delete it, then press Retry"; fi
         fi
-        # If this is cut off, the next run finishes it (see macRecoverBody).
+        # If this is cut off, the next run finishes it (see macRecoverBody). Written whole or not at all.
         MARK=\(marker.map { "\"$HOME/\"" + Shell.q($0) } ?? "\"$ST/.nomark\"")
-        mkdir -p "$(dirname "$MARK")"; printf '%s\\n%s\\n%s\\n' "$APP" "$OLD" \(Shell.q(key)) > "$MARK"
+        mark() { printf "$@" > "$MARK.tmp" && mv -f "$MARK.tmp" "$MARK"; }
+        mkdir -p "$(dirname "$MARK")"
+        mark '%s\\n%s\\n%s\\n' "$APP" "$OLD" \(Shell.q(key)) || up_fail "Couldn't note the swap before starting it"
+        # The last look, right before the move: still closed, and still the version everything was checked against.
+        if app_running || [ "$(current)" != "$CUR" ]; then rm -f "$MARK"; up_fail \(Shell.q("\(name) changed while it was being updated; press Retry")); fi
         mv "$APP" "$OLD" || up_fail "Couldn't move the current version aside"
         up_unregister "$OLD"
         if ! mv "$NEW" "$APP"; then rm -rf "$APP"; mv "$OLD" "$APP"; rm -f "$MARK"; up_fail "Couldn't install \(name) $WANT; the previous version was put back"; fi
@@ -926,8 +950,7 @@ extension Engine {
         if [ "$OLD" = "$KEEP/$AN" ]; then
           rm -f "$MARK"; touch "$KEEP"; echo "BACKUP	$CUR"
         else
-          printf '%s\\n%s\\n%s\\n%s\\n' "$APP" "$OLD" \(Shell.q(key)) "$KEEP/$AN" > "$MARK"
-          if up_file_old "$OLD" "$KEEP/$AN"; then
+          if mark '%s\\n%s\\n%s\\n%s\\n' "$APP" "$OLD" \(Shell.q(key)) "$KEEP/$AN" && up_file_old "$OLD" "$KEEP/$AN"; then
             rm -f "$MARK"; up_unregister "$KEEP/$AN"; touch "$KEEP"; echo "BACKUP	$CUR"
           else
             echo "Couldn't save $CUR for rollback yet (it is at $OLD); the next update tries again" >&2
@@ -950,13 +973,7 @@ extension Engine {
     /// Keeps only the newest `keep` saved versions of "$AN" in "$SV" (variants of one app share the folder).
     /// Never through a symlink: not if any folder from $HOME down to "$SV" is one, nor a version folder or app.
     static func macPruneSnippet(keep: Int) -> String {
-        """
-        up_sv_safe() {
-          up_p="$HOME"; up_rest=${SV#"$HOME"/}
-          IFS=/ read -r -a up_parts <<< "$up_rest"
-          for up_c in "${up_parts[@]}"; do up_p="$up_p/$up_c"; if [ -L "$up_p" ]; then return 1; fi; done
-          [ -d "$SV" ]
-        }
+        svSafeFunction + """
         if up_sv_safe; then
           for d in "$SV"/*; do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir "$d" 2>/dev/null || true; fi; done
           n=0
@@ -969,6 +986,17 @@ extension Engine {
         fi
         """
     }
+
+    /// `up_sv_safe`: true if "$SV" is a real folder and none of the folders from $HOME down to it is a link.
+    static let svSafeFunction = """
+        up_sv_safe() {
+          up_p="$HOME"; up_rest=${SV#"$HOME"/}
+          IFS=/ read -r -a up_parts <<< "$up_rest"
+          for up_c in "${up_parts[@]}"; do up_p="$up_p/$up_c"; if [ -L "$up_p" ]; then return 1; fi; done
+          [ -d "$SV" ]
+        }
+
+        """
 
     /// Clones the installed app before it quits (instant and free on APFS, a full copy elsewhere): an app that
     /// installs its own update on quit replaces itself without keeping the old version. A copy left from an earlier
@@ -995,9 +1023,12 @@ extension Engine {
         up_keep_pre() {
           PRE="$ST/pre/$AN"
           [ -e "$ST/pre" ] || return 0
-          if [ ! -f "$ST/pre/.complete" ] || [ ! -d "$PRE" ]; then rm -rf "$ST/pre"; return 0; fi
+          if [ ! -d "$PRE" ]; then rm -rf "$ST/pre"; return 0; fi
+          # Made by an earlier release (no completion mark): kept only if it is a whole, valid app.
+          if [ ! -f "$ST/pre/.complete" ] && ! codesign --verify --deep --strict "$PRE" >/dev/null 2>&1; then rm -rf "$ST/pre"; return 0; fi
           V=$(defaults read "$PRE/Contents/Info" CFBundleShortVersionString 2>/dev/null) || V=""
           [ -n "$V" ] || return 1
+          if [ -L "$SV" ] || [ -L "$SV/$V" ] || [ -L "$SV/$V/$AN" ]; then return 1; fi
           if [ -d "$SV/$V/$AN" ]; then rm -rf "$ST/pre"; echo "BACKUP	$V"; return 0; fi
           if [ "$1" != 1 ] && [ "$(current)" = "$V" ]; then rm -rf "$ST/pre"; return 0; fi
           mkdir -p "$SV/$V" || return 1
@@ -1035,7 +1066,7 @@ extension Engine {
     static func macKeepCloneScript(app: String, bundleID: String, stage: String, saved: String, keep: Int) -> String {
         macHeader(app: app, bundleID: bundleID) + keepPreFunction + """
         ST="$HOME/"\(Shell.q(stage)); SV="$HOME/"\(Shell.q(saved)); AN=\(Shell.q((app as NSString).lastPathComponent))
-        [ -f "$ST/pre/.complete" ] && [ -d "$ST/pre/$AN" ] || up_fail "The copy made before quitting is gone"
+        [ -d "$ST/pre/$AN" ] || up_fail "The copy made before quitting is gone"
         up_keep_pre 1 || up_fail "Couldn't save the copy made before quitting (it is still at $ST/pre)"
         NOW=$(current)
         if [ -n "$NOW" ] && [ "$NOW" != "$V" ] && [ ! -L "$SV/$NOW" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
@@ -1156,6 +1187,7 @@ extension Engine {
             guard let note else { return o }
             var o = o
             o.message += o.ok ? " (\(note))" : ". \(note)"
+            o.note = note
             return o
         }
         /// A step that adds to or removes from this Mac's saved versions, so Settings can't clean them up meanwhile.
@@ -1346,7 +1378,7 @@ extension Engine {
             }
             if let cur = fields(w)["CURRENT"], !cur.isEmpty, !target.isEmpty, !Version.isNewer(target, than: cur) {
                 var o = UpdateOutcome(ok: true, message: "\(item.name) installed its own update to \(cur)", output: log, installed: cur)
-                if relaunch && fields(w)["RUNNING"] != "1", let note = await reopenApp() { o.message += " (\(note))" }
+                if relaunch && fields(w)["RUNNING"] != "1", let note = await reopenApp() { o.message += " (\(note))"; o.note = note }
                 return o
             }
         }
@@ -1369,7 +1401,7 @@ extension Engine {
             return o
         }
         var o = UpdateOutcome(ok: true, message: "Updated", output: log)
-        if let note { o.message += " (\(note))" }
+        if let note { o.message += " (\(note))"; o.note = note }
         return o
     }
 

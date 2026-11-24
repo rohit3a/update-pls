@@ -1566,6 +1566,7 @@ final class UpdatePlsTests: XCTestCase {
             ("#!/bin/sh\nexec '/Applications/Nope Nope.app/Contents/MacOS/x' \"$@\"\n", ""),
             ("#!/bin/sh\nexec /usr/bin/true # docs \"\(app.path)/Contents/MacOS/T\"\n", ""),
             ("#!/bin/sh\nexport APP_BIN=\"\(app.path)/Contents/MacOS/Bob\"\nexec \"${APP_BIN}\" \"$@\"\n", app.path),
+            ("#!/bin/bash\nexec -l -a bob \"\(app.path)/Contents/MacOS/Bob\" \"$@\"\n", app.path),
         ]
         for (i, (text, want)) in cases.enumerated() {
             let f = root.appendingPathComponent("w\(i)")
@@ -1760,6 +1761,41 @@ final class UpdatePlsTests: XCTestCase {
             XCTAssertEqual(reopened.value, !busy, "busy: \(busy)")
             XCTAssertEqual(sandbox.version(sandbox.app), "1.0")
         }
+    }
+
+    /// A whole copy made before quitting by an earlier release (no completion mark) is filed, not thrown away;
+    /// a swap never writes through a version folder that is a link; a reopen failure outlives confirmation.
+    func testLegacyCopyLinkedVersionFolderAndReopenNote() async throws {
+        let sandbox = try Sandbox()
+        let fm = FileManager.default
+        try sandbox.makeApp(at: sandbox.app, version: "3.0")
+        let item = sandbox.item(installed: "3.0")
+        let stage = sandbox.home.appendingPathComponent(Engine.stagingPath(item))
+        try sandbox.makeApp(at: stage.appendingPathComponent("pre/T.app"), version: "1.0")
+        let discard = await sandbox.runner(Engine.macDiscardScript(app: sandbox.app.path, bundleID: "com.example.t", stage: Engine.stagingPath(item),
+                                                                   saved: Engine.savedPath(item), force: false), 60, nil)
+        XCTAssertTrue(discard.ok, discard.combined)
+        let sv = sandbox.home.appendingPathComponent(Engine.savedPath(item))
+        XCTAssertEqual(sandbox.version(sv.appendingPathComponent("1.0/T.app")), "1.0")
+
+        // 3.0's version folder is a link to a folder holding someone else's T.app.
+        let outside = sandbox.home.appendingPathComponent("Outside")
+        try sandbox.makeApp(at: outside.appendingPathComponent("T.app"), version: "9.9")
+        try fm.createSymbolicLink(at: sv.appendingPathComponent("3.0"), withDestinationURL: outside)
+        let staged = stage.appendingPathComponent("x/T.app")
+        try sandbox.makeApp(at: staged, version: "4.0")
+        let res = await sandbox.runner(Engine.macSwapScript(app: sandbox.app.path, bundleID: "com.example.t", name: "T", staged: staged.path,
+                                                            version: "4.0", stage: Engine.stagingPath(item), saved: Engine.savedPath(item),
+                                                            keep: 3, trust: false, expect: "3.0", forward: true), 60, nil)
+        XCTAssertTrue(res.ok, res.combined)
+        XCTAssertEqual(sandbox.version(outside.appendingPathComponent("T.app")), "9.9", "nothing outside is touched")
+        XCTAssertEqual(sandbox.version(sv.appendingPathComponent("3.0/T.app")), "3.0")
+        XCTAssertEqual(sandbox.version(sandbox.app), "4.0")
+
+        var o = UpdateOutcome(ok: true, message: "Switched to 1.0 (Couldn't reopen T: x)")
+        o.note = "Couldn't reopen T: x"
+        var fresh = item; fresh.installed = "1.0"
+        XCTAssertTrue(Engine.confirm(item, switchedTo: "1.0", o, fresh: fresh, offline: false).message.contains("Couldn't reopen"))
     }
 
     /// A queued job whose installer changed since (a check switched it) runs in that installer's lane.

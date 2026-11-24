@@ -154,7 +154,7 @@ enum Probe {
     }
     up_bundled() {
       [ -f "$1" ] && [ "$(head -c 2 "$1" 2>/dev/null)" = "#!" ] || return 0
-      up_e=$(grep -E '^[[:space:]]*exec[[:space:]]' "$1" 2>/dev/null | head -1 | sed -E 's/^[[:space:]]*exec[[:space:]]+(-a[[:space:]]+[^[:space:]]+[[:space:]]+)?//')
+      up_e=$(grep -E '^[[:space:]]*exec[[:space:]]' "$1" 2>/dev/null | head -1 | sed -E 's/^[[:space:]]*exec[[:space:]]+((-[lc]+|-a[[:space:]]+[^[:space:]]+|--)[[:space:]]+)*//')
       [ -n "$up_e" ] || return 0
       up_t=$(up_word "$up_e")
       case "$up_t" in
