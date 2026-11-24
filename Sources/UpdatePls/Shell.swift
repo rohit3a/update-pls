@@ -31,6 +31,9 @@ enum Shell {
             return wasCancelled
         }
 
+        /// Once the process is reaped its PID can be reused: a cancel after that must signal nothing.
+        func detach() { lock.withLock { pid = nil } }
+
         func cancel() {
             lock.lock()
             cancelled = true
@@ -114,6 +117,7 @@ enum Shell {
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
         p.waitUntilExit()
+        cancelState.detach()
         timer.cancel()
         // Something the process started may still hold the pipes open; don't wait on it forever.
         if sink.closed.wait(timeout: .now() + 5) == .timedOut {
@@ -127,13 +131,22 @@ enum Shell {
                            stderr: String(decoding: e, as: UTF8.self), timedOut: t, cancelled: c)
     }
 
-    /// Stops a process and all its descendants: TERM first, KILL after 3 seconds.
+    /// Stops a process and all its descendants: TERM first, KILL after 3 seconds. Each process is known by its
+    /// PID and start time, so a PID that was freed and handed to another process in between is left alone.
     static func killTree(_ root: pid_t) {
-        let pids = [root] + descendants(of: root)
-        for pid in pids.reversed() { kill(pid, SIGTERM) }
+        let procs = ([root] + descendants(of: root)).compactMap { pid in startTime(pid).map { (pid, $0) } }
+        for (pid, _) in procs.reversed() { kill(pid, SIGTERM) }
         DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-            for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+            for (pid, started) in procs where startTime(pid) == started { kill(pid, SIGKILL) }
         }
+    }
+
+    /// When a process started (microseconds since 1970), or nil if there is no such process.
+    static func startTime(_ pid: pid_t) -> UInt64? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return info.pbi_start_tvsec &* 1_000_000 &+ info.pbi_start_tvusec
     }
 
     static func descendants(of root: pid_t) -> [pid_t] {

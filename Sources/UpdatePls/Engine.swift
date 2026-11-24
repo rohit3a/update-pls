@@ -174,16 +174,29 @@ enum Engine {
     /// Cached login PATH and OS per machine id, populated by full checks so subsequent updates and targeted
     /// verifications skip spawning an interactive login shell or an extra `uname -s` SSH handshake.
     private static let machineCacheLock = NSLock()
-    private static var cachedPaths: [String: String] = [:]
+    private static var cachedPaths: [String: (path: String, at: Date)] = [:]
     private static var cachedOS: [String: OSKind] = [:]
+    /// A login PATH older than this is read again, so a tool installed somewhere new (another nvm version) shows up.
+    static let pathCacheTTL: TimeInterval = 30 * 60
 
-    static func cachedPath(for machine: Machine) -> String? {
-        machineCacheLock.withLock { cachedPaths[machine.id] }
+    static func cachedPath(for machine: Machine, now: Date = Date()) -> String? {
+        machineCacheLock.withLock {
+            guard let c = cachedPaths[machine.id], now.timeIntervalSince(c.at) < pathCacheTTL else { return nil }
+            return c.path
+        }
     }
 
-    static func setCachedPath(_ path: String, for machine: Machine) {
+    static func setCachedPath(_ path: String, for machine: Machine, at: Date = Date()) {
         guard !path.isEmpty else { return }
-        machineCacheLock.withLock { cachedPaths[machine.id] = path }
+        machineCacheLock.withLock { cachedPaths[machine.id] = (path, at) }
+    }
+
+    /// Forgets what was learned about a machine (its system and login PATH), e.g. after its alias was repointed.
+    static func forget(_ machine: Machine) {
+        machineCacheLock.withLock {
+            cachedPaths[machine.id] = nil
+            cachedOS[machine.id] = nil
+        }
     }
 
     static func cachedOS(for machine: Machine) -> OSKind? {
@@ -208,6 +221,8 @@ enum Engine {
                       forcePathRefresh: Bool = false) async -> (MachineStatus, [Item]) {
         let start = Date(), asleep = SleepClock.asleep
         var status = MachineStatus(machine: m)
+        // A check you ask for learns the machine afresh: its alias may now lead somewhere else.
+        if forcePathRefresh { forget(m) }
         let pathHint = forcePathRefresh ? nil : cachedPath(for: m)
         var scan = await scan(m, catalog, cachedPath: pathHint)
         // A connection that dropped mid-scan, or that the Mac's sleep cut off (a background check runs in the
@@ -235,6 +250,7 @@ enum Engine {
         let os: OSKind, out: ShellResult
         switch scan {
         case let .failed(what, msg, _):
+            forget(m)
             if msg.hasPrefix("Couldn't tell what system this is") || msg.contains("Permission denied"), let r = await viaOtherAlias(msg) { return r }
             status.state = .offline(msg)
             Log.error("check \(m.id): \(what): \(msg)")
@@ -243,6 +259,8 @@ enum Engine {
         }
         // Every check prints an OS line first: without one the script never ran (the key only allows one command).
         if !out.stdout.contains("OS\t") {
+            // The script never ran, possibly because the machine isn't the system it was last time.
+            forget(m)
             let msg = "Connected, but this key can't run the check there (it may be limited to one command)"
             if let r = await viaOtherAlias(msg) { return r }
             status.state = .offline(msg)
@@ -250,7 +268,6 @@ enum Engine {
             return (status, [])
         }
         status.os = os
-        setCachedOS(os, for: m)
         if let full = out.stderr.split(separator: "\n").first(where: { $0.contains("Disk quota exceeded") || $0.contains("No space left on device") }) {
             Log.error("check \(m.id): its disk is full, so this check may be missing tools: \(full)")
         }
@@ -260,6 +277,8 @@ enum Engine {
         }
         status.state = .online
         let probe = Probe.parse(out.stdout)
+        // The script says what system it really ran on; trust that over what was remembered.
+        setCachedOS(os == .windows ? os : probe.os, for: m)
         if !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
         for line in probe.recovery { Log.error("check \(m.id): interrupted update: \(line)") }
         if probe.wingetUnreadable { Log.error("check \(m.id): couldn't read winget's list (it may not be in English), so its apps aren't shown") }
@@ -297,7 +316,9 @@ enum Engine {
         let probe = Probe.parse(out.stdout)
         if !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
         let built = buildItems(probe, machine: m, catalog: catalog, preferDirectDownloads: preferDirectDownloads)
-        guard var fresh = built.first(where: { $0.key == item.key }) ?? built.first else {
+        // Only this tool counts: never another one the script happened to report.
+        guard var fresh = built.first(where: { $0.key == item.key })
+                ?? (built.count == 1 && built[0].defID == item.defID ? built[0] : nil) else {
             return (MachineStatus(machine: m, os: item.os, state: .online), nil)
         }
         if fresh.latest == nil {
@@ -484,67 +505,92 @@ enum Engine {
         return nil
     }
 
-    /// Disk usage of local Mac rollback backups (bytes, total saved version count, app folder count).
-    static func backupStats(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> (bytes: Int64, versions: Int, apps: Int) {
-        let root = home.appendingPathComponent(backupsDir)
-        let fm = FileManager.default
-        guard let appDirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else {
-            return (0, 0, 0)
-        }
-        var totalBytes: Int64 = 0
-        var versions = 0
-        var apps = 0
-        for appDir in appDirs {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: appDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
-            let vers = (try? fm.contentsOfDirectory(at: appDir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
-            if !vers.isEmpty { apps += 1 }
-            versions += vers.count
-            if let e = fm.enumerator(at: appDir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]) {
-                for case let url as URL in e {
-                    let vals = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey])
-                    if vals?.isRegularFile == true {
-                        totalBytes += Int64(vals?.totalFileAllocatedSize ?? vals?.fileAllocatedSize ?? 0)
-                    }
-                }
-            }
-        }
-        return (totalBytes, versions, apps)
+    /// True only for a real folder: never a symlink to one (so nothing outside the saved versions is ever
+    /// counted or deleted through a link).
+    static func isRealDirectory(_ url: URL) -> Bool {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType) == .typeDirectory
     }
 
-    /// Prunes local rollback backups to keep at most `keep` newest versions per app (pass 0 to remove all).
-    @discardableResult
-    static func pruneBackups(keep: Int, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> Int {
+    private static func children(_ url: URL) -> [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.contentModificationDateKey],
+                                                       options: .skipsHiddenFiles)) ?? [])
+    }
+
+    /// Every saved app copy on this Mac: Backups/<tool>/<version>/<App>.app, plus copies from Update pls 0.3
+    /// sitting at Backups/<tool>/<App>.app. Symlinks are skipped at every level.
+    static func savedCopies(home: URL = FileManager.default.homeDirectoryForCurrentUser)
+        -> [(tool: URL, folder: URL?, app: URL, date: Date)] {
         let root = home.appendingPathComponent(backupsDir)
-        let fm = FileManager.default
-        guard let appDirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else { return 0 }
-        let lsreg = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-        var removed = 0
-        for appDir in appDirs {
-            guard let vers = try? fm.contentsOfDirectory(at: appDir, includingPropertiesForKeys: [.contentModificationDateKey], options: .skipsHiddenFiles) else { continue }
-            let sorted = vers.sorted { a, b in
-                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return da > db
-            }
-            for old in sorted.dropFirst(max(keep, 0)) {
-                if let apps = try? fm.contentsOfDirectory(at: old, includingPropertiesForKeys: nil) {
-                    for a in apps where a.pathExtension == "app" {
-                        let p = Process()
-                        p.executableURL = URL(fileURLWithPath: lsreg)
-                        p.arguments = ["-u", a.path]
-                        p.standardOutput = FileHandle.nullDevice
-                        p.standardError = FileHandle.nullDevice
-                        try? p.run()
-                        p.waitUntilExit()
+        guard isRealDirectory(root) else { return [] }
+        func date(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast }
+        var out: [(URL, URL?, URL, Date)] = []
+        for tool in children(root) where isRealDirectory(tool) {
+            for entry in children(tool) where isRealDirectory(entry) {
+                if entry.pathExtension == "app" {
+                    out.append((tool, nil, entry, date(entry)))
+                } else {
+                    for app in children(entry) where app.pathExtension == "app" && isRealDirectory(app) {
+                        out.append((tool, entry, app, date(entry)))
                     }
                 }
-                if (try? fm.removeItem(at: old)) != nil { removed += 1 }
-            }
-            if (try? fm.contentsOfDirectory(atPath: appDir.path))?.isEmpty == true {
-                try? fm.removeItem(at: appDir)
             }
         }
-        return removed
+        return out
+    }
+
+    /// Disk usage of local Mac rollback backups (bytes, total saved version count, app folder count).
+    static func backupStats(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> (bytes: Int64, versions: Int, apps: Int) {
+        let copies = savedCopies(home: home)
+        var totalBytes: Int64 = 0
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]
+        for c in copies {
+            // The enumerator doesn't follow symlinks inside the app.
+            guard let e = FileManager.default.enumerator(at: c.app, includingPropertiesForKeys: keys) else { continue }
+            for case let url as URL in e {
+                let vals = try? url.resourceValues(forKeys: Set(keys))
+                if vals?.isRegularFile == true { totalBytes += Int64(vals?.totalFileAllocatedSize ?? vals?.fileAllocatedSize ?? 0) }
+            }
+        }
+        return (totalBytes, copies.count, Set(copies.map(\.tool)).count)
+    }
+
+    enum PruneRefusal: Error, Equatable { case updating }
+
+    /// Prunes local rollback backups to the `keep` newest copies of each app (pass 0 to remove all). Variants of
+    /// one app (T3 Code and T3 Code Nightly) share a folder but are counted apart, so one never costs the other its
+    /// copies. Refused while an update is filing or relying on a saved version on this Mac.
+    static func pruneBackups(keep: Int, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> Result<Int, PruneRefusal> {
+        let markers = home.appendingPathComponent(swapMarkersDir)
+        if !children(markers).isEmpty { return .failure(.updating) }
+        guard case let .success(lock) = ItemLock.take(ItemLock.backupsKey) else { return .failure(.updating) }
+        defer { lock.release() }
+        let fm = FileManager.default
+        let lsreg = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        var removed = 0
+        let byApp = Dictionary(grouping: savedCopies(home: home), by: { "\($0.tool.path)|\($0.app.lastPathComponent)" })
+        for (_, list) in byApp {
+            for old in list.sorted(by: { $0.date > $1.date }).dropFirst(max(keep, 0)) {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: lsreg)
+                p.arguments = ["-u", old.app.path]
+                p.standardOutput = FileHandle.nullDevice
+                p.standardError = FileHandle.nullDevice
+                if (try? p.run()) != nil { p.waitUntilExit() }
+                if (try? fm.removeItem(at: old.app)) != nil { removed += 1 }
+                if let folder = old.folder, children(folder).isEmpty { try? fm.removeItem(at: folder) }
+            }
+        }
+        let root = home.appendingPathComponent(backupsDir)
+        for tool in children(root) where isRealDirectory(tool) && children(tool).isEmpty { try? fm.removeItem(at: tool) }
+        return .success(removed)
+    }
+
+    /// The saved versions of one Mac app on this Mac, as `Item.saved` lists them.
+    static func savedVersions(of item: Item, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String] {
+        let name = (item.path as NSString).lastPathComponent
+        return savedCopies(home: home)
+            .filter { $0.tool.lastPathComponent == item.defID && $0.app.lastPathComponent == name }
+            .sorted { $0.date > $1.date }
+            .compactMap { NSDictionary(contentsOf: $0.app.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String }
     }
 }

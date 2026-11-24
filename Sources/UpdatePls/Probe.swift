@@ -140,7 +140,21 @@ enum Probe {
 
     """#
 
-    static let unixFunctions = #"""
+    /// `up_bundled FILE`: the .app a CLI wrapper script runs, if it is one (T3 Code's `t3` runs
+    /// "/Applications/T3 Code (Nightly).app/Contents/MacOS/..."). Only a script that `exec`s something counts, only
+    /// paths outside comments, quoted either way or not at all, and only an app that is really there.
+    static let bundledFunction = #"""
+    up_bundled() {
+      [ -f "$1" ] && [ "$(head -c 2 "$1" 2>/dev/null)" = "#!" ] || return 0
+      grep -qE '^[[:space:]]*exec[[:space:]]' "$1" 2>/dev/null || return 0
+      up_bp="\"/[^\"]*\\.app/Contents/MacOS/|'/[^']*\\.app/Contents/MacOS/|/[^[:space:]'\"]*\\.app/Contents/MacOS/"
+      grep -vE '^[[:space:]]*#' "$1" 2>/dev/null | grep -oE "$up_bp" 2>/dev/null | sed -E "s|^[\"']||; s|/Contents/MacOS/\$||" |
+        while IFS= read -r up_c; do if [ -d "$up_c" ]; then printf '%s' "$up_c"; break; fi; done
+    }
+
+    """#
+
+    static let unixFunctions = bundledFunction + #"""
     up_real() { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"; }
     # A package.json's name and version as name|version, in one go.
     up_pkg() {
@@ -174,10 +188,7 @@ enum Probe {
           esac
           [ -n "$v" ] || v=$(up_to 20 "$p" --version </dev/null 2>&1 | head -3 | tr '\t\n\r' '   ')
         fi
-        ba=""
-        if [ -f "$r" ] && [ "$(head -c 2 "$r" 2>/dev/null)" = "#!" ]; then
-          ba=$(grep -oE "/([^'\"]*/)?Applications/[^'\"]+\.app/Contents/MacOS/" "$r" 2>/dev/null | sed 's|/Contents/MacOS/$||' | head -1)
-        fi
+        ba=$(up_bundled "$r")
         printf 'CLI\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$b" "$p" "$r" "$v" "$pkg" "$pv" "$nb" "$w" "$ba"
         return
       done
@@ -218,7 +229,7 @@ enum Probe {
     /// Targeted single-item verification script: checks only the tool that just finished updating instead of
     /// scanning every tool on the machine.
     static func verifyScript(for item: Item, catalog: Catalog, cachedPath: String?) -> String {
-        var s = unixPrelude(cachedPath: cachedPath) + debFunctions + #"""
+        var s = unixPrelude(cachedPath: cachedPath) + debFunctions + bundledFunction + #"""
         up_real() { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"; }
         up_pkg() {
           n=$(command -v node 2>/dev/null)
@@ -255,10 +266,7 @@ enum Probe {
                   esac
                   [ -n "$v" ] || v=$(up_to 20 "$p" --version </dev/null 2>&1 | head -3 | tr '\t\n\r' '   ')
                 fi
-                ba=""
-                if [ -f "$r" ] && [ "$(head -c 2 "$r" 2>/dev/null)" = "#!" ]; then
-                  ba=$(grep -oE "/([^'\"]*/)?Applications/[^'\"]+\.app/Contents/MacOS/" "$r" 2>/dev/null | sed 's|/Contents/MacOS/$||' | head -1)
-                fi
+                ba=$(up_bundled "$r")
                 printf 'CLI\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$b" "$p" "$r" "$v" "$pkg" "$pv" "$nb" "$w" "$ba"
                 return
               done
@@ -280,7 +288,8 @@ enum Probe {
               run=0
               printf '%s\\n' "$UP_PS" | grep -F "$a/Contents/MacOS/" >/dev/null && run=1
               printf 'APP\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \(Shell.q(def.id)) \(Shell.q(variant.app)) "$a" "$v" "$bid" "$run"
-              for s in "$HOME/Library/Application Support/Update pls/Backups/\(def.id)"/*/\(Shell.q(variant.app + ".app")) "$HOME/Library/Application Support/Update pls/Backups/\(def.id)"/\(Shell.q(variant.app + ".app")); do
+              up_sv="$HOME/"\(Shell.q("Library/Application Support/Update pls/Backups/" + def.id))
+              for s in "$up_sv"/*/\(Shell.q(variant.app + ".app")) "$up_sv"/\(Shell.q(variant.app + ".app")); do
                 [ -d "$s" ] && printf 'SAVED\\t%s\\t%s\\t%s\\n' \(Shell.q(def.id)) \(Shell.q(variant.app)) "$(defaults read "$s/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
               done
             fi

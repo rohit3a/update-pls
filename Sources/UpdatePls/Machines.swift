@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum OSKind: String { case mac, linux, windows }
@@ -95,27 +96,43 @@ enum SSHConfig {
 }
 
 enum Runner {
-    /// Short per-user socket folder for SSH ControlMaster multiplexing (POSIX AF_UNIX limit is 104 bytes on macOS).
-    private static let controlDir: String = {
-        let dir = "/tmp/up-ssh-\(getuid())"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        return dir
-    }()
-
-    static var sshOptions: [String] {
-        let dir = controlDir
-        if !FileManager.default.fileExists(atPath: dir) {
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    /// Short per-user socket folder for SSH ControlMaster multiplexing (AF_UNIX paths are limited to 104 bytes
+    /// on macOS). Only used if it really is this user's own private folder: anyone else able to create or swap
+    /// it could make connections fail or hand them a socket. Otherwise SSH just connects without sharing.
+    static func controlDir(_ dir: String = "/tmp/upls-\(getuid())") -> String? {
+        if mkdir(dir, 0o700) != 0 && errno != EEXIST { return nil }
+        var st = stat()
+        guard lstat(dir, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == getuid(), (st.st_mode & 0o077) == 0 else {
+            Log.error("ssh: \(dir) isn't a private folder of yours, so connections to other machines aren't shared")
+            return nil
         }
-        return [
+        return dir
+    }
+
+    /// SSH options for one alias. Each alias gets its own shared connection: two aliases for one machine often
+    /// differ in their key (one limited to a single command), and must never borrow each other's session.
+    static func sshOptions(_ alias: String) -> [String] {
+        var o = [
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=4",
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPath=\(dir)/%C",
-            "-o", "ControlPersist=120",
         ]
+        if let dir = controlDir() {
+            o += [
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPath=\(dir)/\(aliasTag(alias))-%C",
+                "-o", "ControlPersist=120",
+            ]
+        } else {
+            o += ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+        }
+        return o
+    }
+
+    /// 12 hex characters naming an alias in its socket path.
+    static func aliasTag(_ alias: String) -> String {
+        SHA256.hash(data: Data(alias.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Reads a PowerShell script from stdin and runs it, so the script never touches the remote command line.
@@ -130,7 +147,7 @@ enum Runner {
 
     static func detectOS(_ m: Machine) async -> Detect {
         if m.isLocal { return .os(.mac) }
-        let r = await Shell.run("/usr/bin/ssh", sshOptions + [m.id, "uname -s"], timeout: 20)
+        let r = await Shell.run("/usr/bin/ssh", sshOptions(m.id) + [m.id, "uname -s"], timeout: 20)
         let d = classify(r)
         Log.info("\(m.id): \(d == .os(.mac) ? "macOS" : d == .os(.linux) ? "Linux" : d == .os(.windows) ? "Windows" : "offline") (ssh exit \(r.status)\(r.timedOut ? ", timed out" : ""))"
                  + (r.ok ? "" : "\n" + r.combined.trimmingCharacters(in: .whitespacesAndNewlines)))
@@ -159,6 +176,6 @@ enum Runner {
         let body = os == .windows ? script : "{\n" + script + "\n} </dev/null\n"
         if m.isLocal { return await Shell.run("/bin/bash", ["-s"], input: body, timeout: timeout, onOutput: onOutput) }
         let remote = os == .windows ? psBootstrap : "bash -s"
-        return await Shell.run("/usr/bin/ssh", sshOptions + [m.id, remote], input: body, timeout: timeout, onOutput: onOutput)
+        return await Shell.run("/usr/bin/ssh", sshOptions(m.id) + [m.id, remote], input: body, timeout: timeout, onOutput: onOutput)
     }
 }

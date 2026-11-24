@@ -12,14 +12,17 @@ enum AppIconCache {
 
     static func icon(for item: Item) -> NSImage? {
         guard item.isApp else { return nil }
+        // Variants (T3 Code and T3 Code Nightly) have their own icons, and an update can bring a new one.
+        let shared = "\(item.defID)|\(item.variant ?? (item.path as NSString).lastPathComponent)"
         if item.machine.isLocal {
-            if let hit = byPath[item.path] { return hit }
+            let key = "\(item.path)|\(item.installed ?? "")"
+            if let hit = byPath[key] { return hit }
             let img = NSWorkspace.shared.icon(forFile: item.path)
-            byPath[item.path] = img
-            byDefID[item.defID] = img
+            byPath[key] = img
+            byDefID[shared] = img
             return img
         }
-        return byDefID[item.defID]
+        return byDefID[shared]
     }
 }
 
@@ -137,6 +140,8 @@ final class AppModel: ObservableObject {
     private var pending: [Machine: [(Item, Job)]] = [:]
     /// Active tasks by item key so running jobs can be cancelled cleanly.
     private var runningTasks: [String: Task<UpdateOutcome, Never>] = [:]
+    /// Each running job's reporter, which knows whether the job has passed its point of no return.
+    private var reporters: [String: Reporter] = [:]
     struct Lane: Hashable { let machine: Machine; let name: String }
     /// When each running job started and last showed progress, by item key.
     private var runStarted: [String: Date] = [:]
@@ -219,12 +224,18 @@ final class AppModel: ObservableObject {
     }
     func isActive(_ item: Item) -> Bool { activity[item.key]?.isActive ?? false }
 
-    /// True if this item is queued or running in a cancellable phase (never during the 1-second atomic swap).
+    /// True if this item is queued, or running and not yet past its point of no return: the job itself says
+    /// when it starts quitting or replacing an app (see `Reporter.commit`). Over SSH, only a Mac app download
+    /// can be stopped, since a cancel can't reach an installer running there.
     func canCancel(_ item: Item) -> Bool {
         switch activity[item.key] {
         case .queued?: return true
-        case let .running(phase, _)?:
-            return !phase.hasPrefix("Installing ") && !phase.hasPrefix("Reopening ")
+        case .running?:
+            guard let r = reporters[item.key], !r.isCommitted else { return false }
+            let current = items.first { $0.key == item.key } ?? item
+            if current.machine.isLocal { return true }
+            if case .macDirect = current.method { return true }
+            return false
         default: return false
         }
     }
@@ -319,19 +330,41 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Why the last cleanup didn't run, for Settings.
+    @Published var backupCleanupNote: String?
+
     func cleanBackups(keep: Int) {
         guard !isCleaningBackups else { return }
+        // An update may be filing a saved version or relying on one to put an app back.
+        guard !isBusy else {
+            backupCleanupNote = "Wait for the updates to finish"
+            return
+        }
+        backupCleanupNote = nil
         isCleaningBackups = true
         Task.detached(priority: .utility) {
-            let removed = Engine.pruneBackups(keep: keep)
+            let result = Engine.pruneBackups(keep: keep)
             let stats = Engine.backupStats()
             await MainActor.run {
                 self.backupBytes = stats.bytes
                 self.backupVersions = stats.versions
                 self.backupApps = stats.apps
                 self.isCleaningBackups = false
-                if removed > 0 { Log.info("pruned \(removed) old rollback backup(s)") }
+                switch result {
+                case let .success(removed):
+                    if removed > 0 { Log.info("pruned \(removed) old rollback backup(s)") }
+                    self.refreshSavedVersions()
+                case .failure:
+                    self.backupCleanupNote = "An update is using the saved versions; try again when it's done"
+                }
             }
+        }
+    }
+
+    /// After a cleanup, rollback menus (and Update after a rollback) offer only copies that still exist.
+    private func refreshSavedVersions() {
+        for i in items.indices where items[i].machine.isLocal {
+            if case .macDirect = items[i].method { items[i].saved = Engine.savedVersions(of: items[i]) }
         }
     }
 
@@ -371,7 +404,8 @@ final class AppModel: ObservableObject {
         let start = Date(), asleep = SleepClock.asleep
         Log.info("checking all machines (\(reason.rawValue))")
         let latestHosts = SSHConfig.hosts()
-        if latestHosts != hosts || hostTargets.isEmpty {
+        // A check you ask for also re-reads where each alias leads (an edited ~/.ssh/config).
+        if latestHosts != hosts || hostTargets.isEmpty || reason == .manual {
             hosts = latestHosts
             if !customScan {
                 hostTargets = await SSHConfig.targetsAsync(latestHosts)
@@ -425,6 +459,9 @@ final class AppModel: ObservableObject {
             switch a {
             case .done where reason == .manual: activity[key] = nil
             case .failed where items.first(where: { $0.key == key })?.state == .upToDate: activity[key] = nil
+            // Its tool (or the alias it was on) is gone: nothing is left to retry or dismiss.
+            case .failed where !items.contains(where: { $0.key == key }): activity[key] = nil
+            case .done where !items.contains(where: { $0.key == key }): activity[key] = nil
             default: break
             }
         }
@@ -575,7 +612,8 @@ final class AppModel: ObservableObject {
             batchTotal = max(0, batchTotal - 1)
             Log.info("cancelled queued \(key)")
         case .running?:
-            guard canCancel(item) else { return }
+            // Checked and recorded in one step, so the job can't commit in between.
+            guard canCancel(item), reporters[key]?.requestCancel() == true else { return }
             runningTasks[key]?.cancel()
             Log.info("cancelling running \(key)")
         default:
@@ -594,7 +632,7 @@ final class AppModel: ObservableObject {
         }
         pending = [:]
         for (key, task) in runningTasks {
-            if let item = items.first(where: { $0.key == key }), canCancel(item) {
+            if let item = items.first(where: { $0.key == key }), canCancel(item), reporters[key]?.requestCancel() == true {
                 task.cancel()
             }
         }
@@ -688,8 +726,24 @@ final class AppModel: ObservableObject {
         // Each job is confirmed as soon as it ends, so one slow update never leaves the others at "checking…".
         while let i = pending[m]?.firstIndex(where: { Self.lane($0.0) == lane.name }) {
             let (queuedItem, job) = pending[m]!.remove(at: i)
-            // Refresh from latest scanned items so we never run with stale version metadata (e.g. after apt refresh).
-            let item = items.first { $0.key == queuedItem.key } ?? queuedItem
+            // Run what the latest check says, never what it said when the job was queued (e.g. after apt refresh).
+            guard let item = items.first(where: { $0.key == queuedItem.key }) else {
+                activity[queuedItem.key] = .failed("\(queuedItem.name) isn't there anymore")
+                batchCompleted += 1
+                continue
+            }
+            // A check since then may have switched its installer (Homebrew ↔ direct download): it belongs in that
+            // installer's lane, so one package manager still never runs twice at once.
+            if Self.lane(item) != lane.name {
+                pending[m, default: []].insert((item, job), at: min(i, pending[m]?.count ?? 0))
+                startLanes(m)
+                continue
+            }
+            if case .update = job, item.state == .upToDate {
+                activity[item.key] = .done("Already on \(item.installed ?? "the latest")")
+                batchCompleted += 1
+                continue
+            }
             let outcome = await run(item, job)
             if outcome.cancelled {
                 activity[item.key] = nil
@@ -723,6 +777,7 @@ final class AppModel: ObservableObject {
                 self.lastProgress[key] = Date()
             }
         }
+        reporters[key] = reporter
         let performFn = perform
         let task = Task<UpdateOutcome, Never> {
             Log.appendRun(file, headerLine)
@@ -733,6 +788,7 @@ final class AppModel: ObservableObject {
         runningTasks[key] = task
         let outcome = await task.value
         runningTasks[key] = nil
+        reporters[key] = nil
         runStarted[key] = nil
         lastProgress[key] = nil
         if outcome.cancelled {
@@ -760,9 +816,19 @@ final class AppModel: ObservableObject {
         let catalog = Catalog.load()
         if !customScan, done.count == 1 {
             let (item, job, o) = done[0]
-            let (status, fresh) = await Engine.verifySingle(item, catalog: catalog, resolver: LatestResolver(),
+            var (status, fresh) = await Engine.verifySingle(item, catalog: catalog, resolver: LatestResolver(),
                                                             preferDirectDownloads: preferDirectDownloads)
-            applySingle(status, fresh)
+            if fresh == nil, case .online = status.state {
+                // The quick read didn't find it (a new PATH, a moved command): read the whole machine afresh.
+                let known = Dictionary(items.filter { $0.machine == m }.compactMap { i in i.latest.map { (i.key, $0) } }, uniquingKeysWith: { a, _ in a })
+                let (st, all) = await Engine.check(m, catalog: catalog, resolver: LatestResolver(), known: known,
+                                                   preferDirectDownloads: preferDirectDownloads, forcePathRefresh: true)
+                apply(st, all)
+                status = st
+                fresh = all.first { $0.key == item.key }
+            } else {
+                applySingle(status, fresh)
+            }
             let offline = if case .offline = status.state { true } else { false }
             let key = item.key
             let version: String? = if case let .install(v, _) = job { v } else { nil }

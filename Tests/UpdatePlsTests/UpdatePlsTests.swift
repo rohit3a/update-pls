@@ -282,7 +282,11 @@ final class UpdatePlsTests: XCTestCase {
             Engine.macStateScript(app: app.path, bundleID: "com.t", marker: Engine.swapMarkerPath(app)),
             Engine.macStageScript(app: app.path, bundleID: "com.t", name: "T", url: "x", info: info, stage: Engine.stagingPath(app), local: "/tmp/T.app"),
             Engine.macStageScript(app: app.path, bundleID: "com.t", name: "T", url: "x", info: info, stage: Engine.stagingPath(app), local: "/tmp/T.zip"),
-            Engine.macCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app)),
+            Engine.macCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app)),
+            Engine.macDiscardScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app), force: true),
+            Engine.macSwapScript(app: app.path, bundleID: "com.t", name: "T", staged: "/tmp/x.app", version: "3", stage: Engine.stagingPath(app),
+                                 saved: Engine.savedPath(app), keep: 3, expect: "2"),
+            Engine.stopShipItScript(app: app.path),
             Engine.macKeepCloneScript(app: app.path, bundleID: "com.t", stage: Engine.stagingPath(app), saved: Engine.savedPath(app), keep: 3),
             Engine.macRecoverScript(marker: Engine.swapMarkerPath(app)),
             Probe.unixScript(Catalog.bundled()),
@@ -1322,7 +1326,7 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(before.versions, 3)
         XCTAssertGreaterThan(before.bytes, 0)
         let removed = Engine.pruneBackups(keep: 1, home: sandbox.home)
-        XCTAssertEqual(removed, 2)
+        XCTAssertEqual(removed, .success(2))
         let after = Engine.backupStats(home: sandbox.home)
         XCTAssertEqual(after.versions, 1)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: saved.path), ["3.0"])
@@ -1364,6 +1368,279 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(ran.value)
     }
 
+
+    // MARK: 0.5.7: fixes from the 0.5.6 audit
+
+    /// The feed advertises 4 but serves 2; the app updates itself to 3 as it quits. Nothing older than what is
+    /// installed now is ever swapped in, and the version it updated itself from is still kept.
+    func testDownloadOlderThanTheAppsOwnUpdateIsNotInstalled() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        var item = sandbox.item(installed: "1.0")
+        item.latest = LatestInfo(version: "4.0", url: zip.absoluteString)
+        let app = sandbox.app
+        let runner: Engine.ScriptRunner = { script, timeout, out in
+            if script.contains("updater_running()") { try? Sandbox.writeInfo(app, version: "3.0") }
+            var res = await sandbox.runner(script, timeout, out)
+            if script.contains("Downloading") { res.stdout = res.stdout.replacingOccurrences(of: "RUNNING\t0", with: "RUNNING\t1") }
+            return res
+        }
+        let o = await Engine.installMacApp(item, version: "4.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, run: runner)
+        XCTAssertFalse(o.ok, o.message)
+        XCTAssertTrue(o.message.contains("isn't newer"), o.message)
+        XCTAssertEqual(sandbox.version(sandbox.app), "3.0", "never downgraded")
+        XCTAssertEqual(sandbox.version(sandbox.home.appendingPathComponent(Engine.savedPath(item)).appendingPathComponent("1.0/T.app")), "1.0")
+    }
+
+    /// The swap itself refuses to run if the installed version is no longer the one the update was checked against.
+    func testSwapRefusesWhenTheInstalledVersionChanged() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let item = sandbox.item(installed: "1.0")
+        let staged = sandbox.home.appendingPathComponent(Engine.stagingPath(item)).appendingPathComponent("x/T.app")
+        try sandbox.makeApp(at: staged, version: "2.0")
+        let res = await sandbox.runner(Engine.macSwapScript(app: sandbox.app.path, bundleID: "com.example.t", name: "T", staged: staged.path,
+                                                            version: "2.0", stage: Engine.stagingPath(item), saved: Engine.savedPath(item),
+                                                            keep: 3, trust: false, expect: "0.9"), 60, nil)
+        XCTAssertFalse(res.ok)
+        XCTAssertTrue(Engine.failure(res).contains("changed to 1.0"), Engine.failure(res))
+        XCTAssertEqual(sandbox.version(sandbox.app), "1.0")
+    }
+
+    /// If the app's own updater is still busy when Update pls gives up waiting, the copy made before quitting is
+    /// kept: that updater is about to replace the version it holds.
+    func testSlowSelfUpdateKeepsTheCopyMadeBeforeQuitting() async throws {
+        let sandbox = try Sandbox()
+        try sandbox.makeApp(at: sandbox.app, version: "1.0")
+        let zip = try sandbox.zippedApp(version: "2.0")
+        var item = sandbox.item(installed: "1.0")
+        item.latest = LatestInfo(version: "2.0", url: zip.absoluteString)
+        let runner: Engine.ScriptRunner = { script, timeout, out in
+            if script.contains("updater_running()") {
+                return ShellResult(status: 1, stdout: "", stderr: "UPFAIL T is still installing its own update. Let it finish, then press Retry.")
+            }
+            var res = await sandbox.runner(script, timeout, out)
+            if script.contains("Downloading") { res.stdout = res.stdout.replacingOccurrences(of: "RUNNING\t0", with: "RUNNING\t1") }
+            return res
+        }
+        let o = await Engine.installMacApp(item, version: "2.0", from: .download(item.latest!), exact: false, relaunch: false, Reporter(),
+                                           trust: false, run: runner)
+        XCTAssertFalse(o.ok)
+        XCTAssertEqual(sandbox.version(sandbox.home.appendingPathComponent(Engine.savedPath(item)).appendingPathComponent("1.0/T.app")), "1.0")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.home.appendingPathComponent(Engine.stagingPath(item)).path))
+    }
+
+    /// Cancel is honoured until the job commits (about to quit or replace an app), and refused after.
+    @MainActor
+    func testCancelIsRefusedOnceAJobCommits() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let model = AppModel(autostart: false)
+        var a = Item(machine: .local, os: .mac, defID: "a", name: "A", brand: "A", isApp: false, path: "/a",
+                     installed: "1.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "a"))
+        a.state = .available
+        let finished = Box(false)
+        model.items = [a]
+        model.perform = { _, _, r in
+            r.phase("Downloading")
+            try? await Task.sleep(for: .milliseconds(300))
+            guard r.commit() else { return .cancelledOutcome() }
+            r.phase("Installing")
+            _ = await Shell.run("/bin/sleep", ["0.5"], timeout: 10)
+            finished.mutate { $0 = true }
+            return UpdateOutcome(ok: true, message: "Updated", changed: false)
+        }
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [a]) }
+        model.enqueue([(a, .update)])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(model.canCancel(a))
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertFalse(model.canCancel(a), "past the point of no return")
+        model.cancel(a)
+        for _ in 0..<60 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertTrue(finished.value, "a committed job runs to the end")
+        if case .done? = model.activity[a.key] {} else { XCTFail("expected done, got \(String(describing: model.activity[a.key]))") }
+    }
+
+    /// A cancelled waiter leaves the swap line at once, and the gate passes straight to the next in line.
+    func testSwapGateCancelledWaiterLeavesTheLine() async throws {
+        let gate = SwapGate()
+        let m = "gate-test"
+        let first = await gate.acquire(machineID: m)
+        XCTAssertTrue(first)
+        let waiter = Task { await gate.acquire(machineID: m) }
+        try await Task.sleep(for: .milliseconds(50))
+        waiter.cancel()
+        let cancelled = await waiter.value
+        XCTAssertFalse(cancelled)
+        let next = Task { await gate.acquire(machineID: m) }
+        try await Task.sleep(for: .milliseconds(50))
+        await gate.release(machineID: m)
+        let got = await next.value
+        XCTAssertTrue(got)
+        let busy = await gate.isBusy(m)
+        XCTAssertTrue(busy, "handed over, never free in between")
+        await gate.release(machineID: m)
+        let free = await gate.isBusy(m)
+        XCTAssertFalse(free)
+    }
+
+    /// Cleanup keeps each variant's own copies, never deletes anything through a symlink, and waits for swaps.
+    func testPruneKeepsVariantsApartAndNeverFollowsSymlinks() throws {
+        let sandbox = try Sandbox()
+        let fm = FileManager.default
+        let root = sandbox.home.appendingPathComponent(Engine.backupsDir)
+        let t3 = root.appendingPathComponent("t3code")
+        try sandbox.makeApp(at: t3.appendingPathComponent("1.0/T3 Code.app"), version: "1.0")
+        try sandbox.makeApp(at: t3.appendingPathComponent("2.0-nightly/T3 Code (Nightly).app"), version: "2.0-nightly")
+        try sandbox.makeApp(at: t3.appendingPathComponent("3.0-nightly/T3 Code (Nightly).app"), version: "3.0-nightly")
+        for (i, v) in ["1.0", "2.0-nightly", "3.0-nightly"].enumerated() {
+            try fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: TimeInterval(i * 60))], ofItemAtPath: t3.appendingPathComponent(v).path)
+        }
+        // A link to somewhere else entirely, laid out like saved versions.
+        let outside = sandbox.home.appendingPathComponent("Archive")
+        try sandbox.makeApp(at: outside.appendingPathComponent("1.0/Keep.app"), version: "1.0")
+        try fm.createSymbolicLink(at: root.appendingPathComponent("linked"), withDestinationURL: outside)
+
+        // A swap in progress: nothing is touched.
+        let markers = sandbox.home.appendingPathComponent(Engine.swapMarkersDir)
+        try fm.createDirectory(at: markers, withIntermediateDirectories: true)
+        try "x".write(to: markers.appendingPathComponent("t3code-T3 Code.app"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(Engine.pruneBackups(keep: 0, home: sandbox.home), .failure(.updating))
+        try fm.removeItem(at: markers.appendingPathComponent("t3code-T3 Code.app"))
+
+        XCTAssertEqual(Engine.pruneBackups(keep: 1, home: sandbox.home), .success(1))
+        XCTAssertTrue(fm.fileExists(atPath: t3.appendingPathComponent("1.0/T3 Code.app").path), "stable keeps its only copy")
+        XCTAssertTrue(fm.fileExists(atPath: t3.appendingPathComponent("3.0-nightly/T3 Code (Nightly).app").path))
+        XCTAssertFalse(fm.fileExists(atPath: t3.appendingPathComponent("2.0-nightly").path))
+        let item = Item(machine: .local, os: .mac, defID: "t3code", name: "T3 Code (Nightly)", brand: "T3", isApp: true,
+                        path: "/Applications/T3 Code (Nightly).app", method: .macDirect(appPath: "/Applications/T3 Code (Nightly).app", bundleID: "x"))
+        XCTAssertEqual(Engine.savedVersions(of: item, home: sandbox.home), ["3.0-nightly"])
+
+        XCTAssertEqual(Engine.pruneBackups(keep: 0, home: sandbox.home), .success(2))
+        XCTAssertTrue(fm.fileExists(atPath: outside.appendingPathComponent("1.0/Keep.app").path), "never through a symlink")
+        XCTAssertEqual(Engine.backupStats(home: sandbox.home).versions, 0)
+    }
+
+    /// An update that says it worked, after which the tool can't be found or read, isn't reported as done.
+    func testUpdateWithoutAReadableVersionIsNotConfirmed() {
+        let item = Item(machine: .local, os: .mac, defID: "x", name: "X", brand: "X", isApp: false, path: "/x", installed: "1.0", method: .bun(package: "x"))
+        let ok = UpdateOutcome(ok: true, message: "Updated")
+        XCTAssertFalse(Engine.confirm(item, switchedTo: nil, ok, fresh: nil, offline: false).ok)
+        var unread = item; unread.installed = nil
+        XCTAssertFalse(Engine.confirm(item, switchedTo: nil, ok, fresh: unread, offline: false).ok)
+        XCTAssertTrue(Engine.confirm(item, switchedTo: nil, UpdateOutcome(ok: true, message: "Already on 1.0", changed: false), fresh: nil, offline: false).ok)
+        XCTAssertTrue(Engine.confirm(item, switchedTo: nil, ok, fresh: nil, offline: true).ok)
+    }
+
+    /// Each alias has its own shared SSH connection in a private folder, and the socket path fits macOS's limit.
+    func testSSHSocketsArePerAliasAndPrivate() throws {
+        func path(_ o: [String]) -> String? { o.first { $0.hasPrefix("ControlPath=") } }
+        let a = Runner.sshOptions("box-full"), b = Runner.sshOptions("box-limited")
+        let pa = try XCTUnwrap(path(a)), pb = try XCTUnwrap(path(b))
+        XCTAssertNotEqual(pa, pb)
+        // %C is 40 characters, and OpenSSH adds 17 while it sets the socket up.
+        XCTAssertLessThan(pa.dropFirst("ControlPath=".count).replacingOccurrences(of: "%C", with: String(repeating: "x", count: 40)).count + 17, 104)
+        let open = FileManager.default.temporaryDirectory.appendingPathComponent("up-ssh-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: open, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: open) }
+        XCTAssertNil(Runner.controlDir(open.path), "a folder others can write to is never used")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: open.path)
+        XCTAssertEqual(Runner.controlDir(open.path), open.path)
+    }
+
+    /// Wrapper detection: a comment never counts, a double-quoted path with an apostrophe does, and only apps
+    /// that exist.
+    func testWrapperDetectionNeedsARealExecTarget() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("up-wrap-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let app = root.appendingPathComponent("Bob's App.app")
+        try fm.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
+        let cases: [(String, String)] = [
+            ("#!/bin/sh\n# runs \(app.path)/Contents/MacOS/x\nexec /usr/bin/true \"$@\"\n", ""),
+            ("#!/bin/sh\nexec \"\(app.path)/Contents/MacOS/Bob\" \"$@\"\n", app.path),
+            ("#!/bin/sh\nexec '/Applications/Nope Nope.app/Contents/MacOS/x' \"$@\"\n", ""),
+        ]
+        for (i, (text, want)) in cases.enumerated() {
+            let f = root.appendingPathComponent("w\(i)")
+            try text.write(to: f, atomically: true, encoding: .utf8)
+            let p = Process(), out = Pipe()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = ["-c", Probe.bundledFunction + "up_bundled \(Shell.q(f.path))"]
+            p.standardOutput = out
+            try p.run()
+            let got = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            p.waitUntilExit()
+            XCTAssertEqual(got, want, text)
+        }
+    }
+
+    /// An app on another volume than the saved versions is still swapped by renames on its own volume: the new
+    /// version is copied next to it and checked there first, and the old one is filed away afterwards.
+    func testSwapAcrossVolumesUsesRenamesNextToTheApp() async throws {
+        let sandbox = try Sandbox()
+        let fm = FileManager.default
+        let dmg = sandbox.home.appendingPathComponent("vol.dmg"), mnt = sandbox.home.appendingPathComponent("Vol")
+        func hdiutil(_ args: [String]) -> Int32 {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil"); p.arguments = args
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return -1 }
+            p.waitUntilExit(); return p.terminationStatus
+        }
+        guard hdiutil(["create", "-size", "20m", "-fs", "APFS", "-volname", "UPT", dmg.path]) == 0,
+              hdiutil(["attach", "-nobrowse", "-mountpoint", mnt.path, dmg.path]) == 0 else {
+            throw XCTSkip("couldn't make a second volume here")
+        }
+        defer { _ = hdiutil(["detach", mnt.path, "-force"]) }
+        let app = mnt.appendingPathComponent("T.app")
+        try sandbox.makeApp(at: app, version: "1.0")
+        var item = sandbox.item(installed: "1.0")
+        item.path = app.path
+        item.method = .macDirect(appPath: app.path, bundleID: "com.example.t")
+        let staged = sandbox.home.appendingPathComponent(Engine.stagingPath(item)).appendingPathComponent("x/T.app")
+        try sandbox.makeApp(at: staged, version: "2.0")
+        let res = await sandbox.runner(Engine.macSwapScript(app: app.path, bundleID: "com.example.t", name: "T", staged: staged.path,
+                                                            version: "2.0", stage: Engine.stagingPath(item), saved: Engine.savedPath(item),
+                                                            keep: 3, marker: Engine.swapMarkerPath(item), key: item.key, trust: true, expect: "1.0"), 120, nil)
+        XCTAssertTrue(res.ok, res.combined)
+        XCTAssertEqual(sandbox.version(app), "2.0")
+        XCTAssertEqual(sandbox.version(sandbox.home.appendingPathComponent(Engine.savedPath(item)).appendingPathComponent("1.0/T.app")), "1.0")
+        let leftovers = try fm.contentsOfDirectory(atPath: mnt.path).filter { $0.contains("update-pls") }
+        XCTAssertEqual(leftovers, [], "no temporary copies left next to the app")
+        XCTAssertFalse(fm.fileExists(atPath: sandbox.home.appendingPathComponent(Engine.swapMarkerPath(item)).path))
+    }
+
+    /// A queued job whose installer changed since (a check switched it) runs in that installer's lane.
+    @MainActor
+    func testQueuedJobFollowsItsInstallerToItsLane() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let model = AppModel(autostart: false)
+        var x = Item(machine: .local, os: .mac, defID: "x", name: "X", brand: "X", isApp: false, path: "/x",
+                     installed: "1.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "x"))
+        x.state = .available
+        var y = x; y.defID = "y"; y.name = "Y"; y.path = "/y"; y.method = .bun(package: "y")
+        model.items = [x, y]
+        let ran = Box<[String: String]>([:])
+        model.perform = { item, _, _ in
+            ran.mutate { $0[item.defID] = AppModel.lane(item) }
+            if item.defID == "x" { try? await Task.sleep(for: .milliseconds(300)) }
+            return UpdateOutcome(ok: true, message: "Updated", changed: false)
+        }
+        let movedY: Item = { var v = y; v.method = .pipx("y"); return v }()
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [x, movedY]) }
+        model.enqueue([(x, .update), (y, .update)])
+        try await Task.sleep(for: .milliseconds(100))
+        // While X runs, a check finds Y is now a pipx install.
+        model.items = [x, movedY]
+        for _ in 0..<60 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertEqual(ran.value["y"], "pipx")
+    }
 }
 
 /// A throwaway home folder with stand-in apps, and a script runner that uses it as $HOME. Removed when the test ends.

@@ -63,13 +63,16 @@ struct Catalog: Codable {
     }
 
     private static let cacheLock = NSLock()
-    private static var cachedUserMTime: Date?
+    private static var cachedUserMTime: String?
     private static var cachedCatalog: Catalog?
 
     /// Built-in catalog plus the user's own file; user entries replace built-ins with the same id.
     /// Cached in memory and invalidated automatically whenever `~/.config/update-pls/harnesses.json` changes.
+    /// The file it is read from counts, so a symlink into a dotfiles repo is followed (its own date never changes).
     static func load() -> Catalog {
-        let mtime = (try? FileManager.default.attributesOfItem(atPath: userFile.path)[.modificationDate]) as? Date
+        let real = userFile.resolvingSymlinksInPath().path
+        let a = try? FileManager.default.attributesOfItem(atPath: real)
+        let mtime = a.map { "\(real)|\(($0[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)|\($0[.size] ?? 0)|\($0[.systemFileNumber] ?? 0)" }
         return cacheLock.withLock {
             if let hit = cachedCatalog, cachedUserMTime == mtime { return hit }
             var c = bundled()

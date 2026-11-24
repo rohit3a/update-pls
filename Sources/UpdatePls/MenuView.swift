@@ -48,6 +48,9 @@ struct MenuView: View {
             footer
         }
         .frame(width: 400)
+        // The menu bar window is see-through glass. In Light mode over dark windows it turns mid-gray while the
+        // text stays dark, which is hard to read; a solid window background reads the same over anything.
+        .background(Color(nsColor: .windowBackgroundColor))
         .onChange(of: model.updateCount) { _, count in
             if count == 0 && !model.isBusy && model.failedCount == 0 && filter == .updates {
                 filter = .all
@@ -612,9 +615,13 @@ struct SettingsView: View {
                 }
                 HStack {
                     Button("Keep latest 1 per app") { model.cleanBackups(keep: 1) }
-                        .disabled(model.isCleaningBackups || model.backupVersions <= model.backupApps)
+                        .disabled(model.isCleaningBackups || model.isBusy || model.backupVersions <= model.backupApps)
                     Button("Clear all backups") { model.cleanBackups(keep: 0) }
-                        .disabled(model.isCleaningBackups || model.backupVersions == 0)
+                        .disabled(model.isCleaningBackups || model.isBusy || model.backupVersions == 0)
+                }
+                .help(model.isBusy ? "Available once the running updates finish" : "")
+                if let note = model.backupCleanupNote {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
                 }
             }
             Section("Advanced") {
