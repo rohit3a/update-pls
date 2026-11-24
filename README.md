@@ -34,7 +34,7 @@ Each tool is updated the same way it was installed:
 | Homebrew | `brew upgrade` / `brew upgrade --cask` |
 | Native installer | the tool's own updater (`claude update`, `codex update`, `droid update`, `agy update`, ...) |
 | pipx / uv / bun | `pipx upgrade` / `uv tool upgrade` / `bun add -g` |
-| Mac app download | the publisher's build, checked before it replaces the app (see below) |
+| Mac app download | the publisher's build, checked before it replaces the app (see below); preferred by default even for Homebrew Cask apps so you keep APFS rollback and signature checks (toggle in Settings) |
 | winget (Windows) | `winget upgrade --id ...` |
 | apt (Linux) | `apt-get install --only-upgrade` when sudo works without a password there (its package lists are refreshed first if they are over 12 hours old); otherwise a **Copy sudo command** button. An app that is open there is downloaded first, then quit (after asking), updated and opened again there |
 

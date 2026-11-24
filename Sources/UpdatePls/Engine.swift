@@ -13,6 +13,8 @@ enum Method: Hashable {
     case winget(String)
     /// An apt package; with `passwordless`, sudo works without a password on that machine, so Update pls runs it.
     case deb(String, passwordless: Bool = false)
+    /// A CLI wrapper script that delegates directly to a macOS `.app` bundle (e.g. `~/.t3/bin/t3` -> `T3 Code (Nightly).app`).
+    case bundledWithApp(appPath: String, appName: String)
     case none
 
     var label: String {
@@ -26,6 +28,24 @@ enum Method: Hashable {
         case .macDirect: "direct download"
         case .winget: "winget"
         case .deb: "apt"
+        case let .bundledWithApp(_, name): "bundled in \(name)"
+        case .none: "manual"
+        }
+    }
+
+    /// Short badge label shown inline in row subtitles.
+    var shortLabel: String {
+        switch self {
+        case .npm: "npm"
+        case .bun: "bun"
+        case .brewFormula, .cask: "brew"
+        case .pipx: "pipx"
+        case .uv: "uv"
+        case .selfUpdate: "native"
+        case .macDirect: "direct"
+        case .winget: "winget"
+        case .deb: "apt"
+        case .bundledWithApp: "bundled"
         case .none: "manual"
         }
     }
@@ -109,7 +129,7 @@ struct Item: Identifiable, Hashable {
         case let .deb(p, passwordless):
             if !passwordless { return "sudo apt-get update && sudo apt-get install --only-upgrade -y \(Shell.q(p))" }
             return "sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y \(Shell.q(p))"
-        case .none: return nil
+        case .bundledWithApp, .none: return nil
         }
     }
 
@@ -151,17 +171,50 @@ enum SleepClock {
 }
 
 enum Engine {
+    /// Cached login PATH and OS per machine id, populated by full checks so subsequent updates and targeted
+    /// verifications skip spawning an interactive login shell or an extra `uname -s` SSH handshake.
+    private static let machineCacheLock = NSLock()
+    private static var cachedPaths: [String: String] = [:]
+    private static var cachedOS: [String: OSKind] = [:]
+
+    static func cachedPath(for machine: Machine) -> String? {
+        machineCacheLock.withLock { cachedPaths[machine.id] }
+    }
+
+    static func setCachedPath(_ path: String, for machine: Machine) {
+        guard !path.isEmpty else { return }
+        machineCacheLock.withLock { cachedPaths[machine.id] = path }
+    }
+
+    static func cachedOS(for machine: Machine) -> OSKind? {
+        if machine.isLocal { return .mac }
+        return machineCacheLock.withLock { cachedOS[machine.id] }
+    }
+
+    static func setCachedOS(_ os: OSKind, for machine: Machine) {
+        machineCacheLock.withLock { cachedOS[machine.id] = os }
+    }
+
+    /// When true (the default), Mac apps installed via Homebrew Cask use direct downloads instead of `brew upgrade --cask`,
+    /// enabling APFS rollback backups, signature/TeamID verification, pending-update reuse, and avoiding Homebrew quarantine/ShipIt issues.
+    static var preferDirectDownloads: Bool {
+        !UserDefaults.standard.bool(forKey: "useHomebrewForApps")
+    }
+
     /// Finds what is installed on a machine and the newest version of each.
     /// `known` reuses latest versions already looked up (by item key), so a re-check after an update stays quick.
-    static func check(_ m: Machine, catalog: Catalog, resolver: LatestResolver, known: [String: LatestInfo] = [:]) async -> (MachineStatus, [Item]) {
+    static func check(_ m: Machine, catalog: Catalog, resolver: LatestResolver, known: [String: LatestInfo] = [:],
+                      preferDirectDownloads: Bool = Engine.preferDirectDownloads,
+                      forcePathRefresh: Bool = false) async -> (MachineStatus, [Item]) {
         let start = Date(), asleep = SleepClock.asleep
         var status = MachineStatus(machine: m)
-        var scan = await scan(m, catalog)
+        let pathHint = forcePathRefresh ? nil : cachedPath(for: m)
+        var scan = await scan(m, catalog, cachedPath: pathHint)
         // A connection that dropped mid-scan, or that the Mac's sleep cut off (a background check runs in the
         // few seconds of a dark wake), says nothing about the machine: try it once more.
         if case let .failed(what, msg, dropped) = scan, dropped || SleepClock.asleep - asleep > 1 {
             Log.info("check \(m.id): \(what): \(msg); trying again")
-            scan = await self.scan(m, catalog)
+            scan = await self.scan(m, catalog, cachedPath: pathHint)
         }
         // This alias reaches the machine but can't run the check there (a key limited to one program, or refused):
         // try the other aliases for the same machine, and start with the one that works next time.
@@ -169,7 +222,8 @@ enum Engine {
             for (k, alias) in m.fallbacks.enumerated() {
                 Log.info("check \(m.id): \(msg); trying \(alias), the same machine")
                 let alt = Machine(id: alias, name: alias, fallbacks: Array(m.fallbacks.dropFirst(k + 1)))
-                let r = await check(alt, catalog: catalog, resolver: resolver, known: known)
+                let r = await check(alt, catalog: catalog, resolver: resolver, known: known,
+                                    preferDirectDownloads: preferDirectDownloads, forcePathRefresh: forcePathRefresh)
                 if case .online = r.0.state {
                     if let t = SSHConfig.target(alias) { SSHConfig.preferred[t] = alias }
                     return r
@@ -196,6 +250,7 @@ enum Engine {
             return (status, [])
         }
         status.os = os
+        setCachedOS(os, for: m)
         if let full = out.stderr.split(separator: "\n").first(where: { $0.contains("Disk quota exceeded") || $0.contains("No space left on device") }) {
             Log.error("check \(m.id): its disk is full, so this check may be missing tools: \(full)")
         }
@@ -205,9 +260,10 @@ enum Engine {
         }
         status.state = .online
         let probe = Probe.parse(out.stdout)
+        if !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
         for line in probe.recovery { Log.error("check \(m.id): interrupted update: \(line)") }
         if probe.wingetUnreadable { Log.error("check \(m.id): couldn't read winget's list (it may not be in English), so its apps aren't shown") }
-        var items = buildItems(probe, machine: m, catalog: catalog)
+        var items = buildItems(probe, machine: m, catalog: catalog, preferDirectDownloads: preferDirectDownloads)
         await withTaskGroup(of: (Int, LatestInfo?).self) { group in
             for (i, item) in items.enumerated() where item.latest == nil {
                 if let k = known[item.key] { items[i].latest = k; continue }
@@ -221,19 +277,54 @@ enum Engine {
         return (status, items)
     }
 
+    /// Fast single-item verification after an update: probes only `item` (reusing cached OS + PATH + latest info)
+    /// instead of re-scanning every tool on the machine. Falls back to full check on Windows.
+    static func verifySingle(_ item: Item, catalog: Catalog, resolver: LatestResolver,
+                             preferDirectDownloads: Bool = Engine.preferDirectDownloads) async -> (MachineStatus, Item?) {
+        let m = item.machine
+        if item.os == .windows {
+            let known = item.latest.map { [item.key: $0] } ?? [:]
+            let (st, all) = await check(m, catalog: catalog, resolver: resolver, known: known, preferDirectDownloads: preferDirectDownloads)
+            return (st, all.first { $0.key == item.key })
+        }
+        let start = Date(), asleep = SleepClock.asleep
+        let script = Probe.verifyScript(for: item, catalog: catalog, cachedPath: cachedPath(for: m))
+        let out = await Runner.run(m, os: item.os, script: script, timeout: 60)
+        if out.status == 255 || (out.timedOut && out.stdout.isEmpty) {
+            let msg = out.timedOut ? "Timed out" : out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (MachineStatus(machine: m, os: item.os, state: .offline(msg)), nil)
+        }
+        let probe = Probe.parse(out.stdout)
+        if !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
+        let built = buildItems(probe, machine: m, catalog: catalog, preferDirectDownloads: preferDirectDownloads)
+        guard var fresh = built.first(where: { $0.key == item.key }) ?? built.first else {
+            return (MachineStatus(machine: m, os: item.os, state: .online), nil)
+        }
+        if fresh.latest == nil {
+            fresh.latest = item.latest
+        }
+        fresh.state = state(fresh)
+        Log.info("verify \(item.key) in \(SleepClock.took(since: start, asleep: asleep)): \(fresh.summary) \(fresh.state)\(fresh.running ? " open" : "")")
+        return (MachineStatus(machine: m, os: item.os, state: .online), fresh)
+    }
+
     private enum Scan {
         case done(OSKind, ShellResult)
         /// `dropped`: the machine answered, then the connection went away.
         case failed(String, String, dropped: Bool)
     }
 
-    private static func scan(_ m: Machine, _ catalog: Catalog) async -> Scan {
+    private static func scan(_ m: Machine, _ catalog: Catalog, cachedPath: String? = nil) async -> Scan {
         let os: OSKind
-        switch await Runner.detectOS(m) {
-        case let .offline(msg): return .failed("offline", msg, dropped: false)
-        case let .os(o): os = o
+        if let known = cachedOS(for: m) {
+            os = known
+        } else {
+            switch await Runner.detectOS(m) {
+            case let .offline(msg): return .failed("offline", msg, dropped: false)
+            case let .os(o): os = o
+            }
         }
-        let script = os == .windows ? Probe.windowsScript(catalog) : Probe.unixScript(catalog)
+        let script = os == .windows ? Probe.windowsScript(catalog) : Probe.unixScript(catalog, cachedPath: cachedPath)
         let out = await Runner.run(m, os: os, script: script, timeout: 240)
         if out.status == 255 || (out.timedOut && out.stdout.isEmpty) {
             let msg = out.timedOut ? "Timed out" : out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -250,7 +341,8 @@ enum Engine {
         return Version.isNewer(latest, than: installed) ? .available : .upToDate
     }
 
-    static func buildItems(_ p: ProbeResult, machine: Machine, catalog: Catalog) -> [Item] {
+    static func buildItems(_ p: ProbeResult, machine: Machine, catalog: Catalog,
+                           preferDirectDownloads: Bool = Engine.preferDirectDownloads) -> [Item] {
         var items: [Item] = []
         for r in p.clis {
             guard let def = catalog.clis.first(where: { $0.id == r.id }) else { continue }
@@ -261,7 +353,7 @@ enum Engine {
         for r in p.apps {
             guard let def = catalog.apps.first(where: { $0.id == r.id }),
                   let variant = def.mac?.first(where: { $0.app == r.appName }) else { continue }
-            let method: Method = if let t = variant.latest.cask, p.hasBrew, p.casks.contains(t) { .cask(t) }
+            let method: Method = if !preferDirectDownloads, let t = variant.latest.cask, p.hasBrew, p.casks.contains(t) { .cask(t) }
                                  else { .macDirect(appPath: r.path, bundleID: r.bundleID) }
             let name = def.mac!.count == 1 ? def.name : r.appName.hasPrefix(def.name) ? r.appName : "\(def.name) (\(r.appName))"
             let saved = Set(p.saved.filter { $0.id == r.id && $0.appName == r.appName }.map(\.version))
@@ -301,6 +393,10 @@ enum Engine {
     }
 
     static func cliMethod(_ r: CLIRecord, def: CLIDef, os: OSKind, installed: String?) -> Method {
+        if os == .mac, !r.bundledApp.isEmpty {
+            let appName = ((r.bundledApp as NSString).lastPathComponent as NSString).deletingPathExtension
+            return .bundledWithApp(appPath: r.bundledApp, appName: appName.isEmpty ? "the app" : appName)
+        }
         let real = r.realPath.replacingOccurrences(of: "\\", with: "/")
         func component(after marker: String) -> String? {
             guard let range = real.range(of: marker) else { return nil }
@@ -366,4 +462,89 @@ enum Engine {
         "\(swapMarkersDir)/\(item.defID)-\((item.path as NSString).lastPathComponent)"
     }
     static let swapMarkersDir = "Library/Application Support/Update pls/Swapping"
+    static let backupsDir = "Library/Application Support/Update pls/Backups"
+
+    /// A human-readable changelog or releases page for this tool, when one can be derived from the catalog.
+    static func releaseNotesURL(for item: Item, catalog: Catalog) -> URL? {
+        if item.isApp {
+            if let repo = LatestResolver.githubRepo(item, catalog: catalog) {
+                return URL(string: "https://github.com/\(repo)/releases")
+            }
+            let variant = catalog.apps.first { $0.id == item.defID }?.mac?.first { item.path.hasSuffix("/\($0.app).app") }
+            if let cask = variant?.latest.cask {
+                return URL(string: "https://formulae.brew.sh/cask/\(cask)")
+            }
+            return nil
+        }
+        let def = catalog.clis.first { $0.id == item.defID }
+        if let gh = def?.latest?.github { return URL(string: "https://github.com/\(gh)/releases") }
+        let (npm, pypi) = registryPackage(item, catalog: catalog)
+        if let pkg = npm ?? def?.latest?.npm { return URL(string: "https://www.npmjs.com/package/\(pkg)?activeTab=versions") }
+        if let pkg = pypi ?? def?.latest?.pypi { return URL(string: "https://pypi.org/project/\(pkg)/#history") }
+        return nil
+    }
+
+    /// Disk usage of local Mac rollback backups (bytes, total saved version count, app folder count).
+    static func backupStats(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> (bytes: Int64, versions: Int, apps: Int) {
+        let root = home.appendingPathComponent(backupsDir)
+        let fm = FileManager.default
+        guard let appDirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else {
+            return (0, 0, 0)
+        }
+        var totalBytes: Int64 = 0
+        var versions = 0
+        var apps = 0
+        for appDir in appDirs {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: appDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let vers = (try? fm.contentsOfDirectory(at: appDir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
+            if !vers.isEmpty { apps += 1 }
+            versions += vers.count
+            if let e = fm.enumerator(at: appDir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]) {
+                for case let url as URL in e {
+                    let vals = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey])
+                    if vals?.isRegularFile == true {
+                        totalBytes += Int64(vals?.totalFileAllocatedSize ?? vals?.fileAllocatedSize ?? 0)
+                    }
+                }
+            }
+        }
+        return (totalBytes, versions, apps)
+    }
+
+    /// Prunes local rollback backups to keep at most `keep` newest versions per app (pass 0 to remove all).
+    @discardableResult
+    static func pruneBackups(keep: Int, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> Int {
+        let root = home.appendingPathComponent(backupsDir)
+        let fm = FileManager.default
+        guard let appDirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else { return 0 }
+        let lsreg = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        var removed = 0
+        for appDir in appDirs {
+            guard let vers = try? fm.contentsOfDirectory(at: appDir, includingPropertiesForKeys: [.contentModificationDateKey], options: .skipsHiddenFiles) else { continue }
+            let sorted = vers.sorted { a, b in
+                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return da > db
+            }
+            for old in sorted.dropFirst(max(keep, 0)) {
+                if let apps = try? fm.contentsOfDirectory(at: old, includingPropertiesForKeys: nil) {
+                    for a in apps where a.pathExtension == "app" {
+                        let p = Process()
+                        p.executableURL = URL(fileURLWithPath: lsreg)
+                        p.arguments = ["-u", a.path]
+                        p.standardOutput = FileHandle.nullDevice
+                        p.standardError = FileHandle.nullDevice
+                        try? p.run()
+                        p.waitUntilExit()
+                    }
+                }
+                if (try? fm.removeItem(at: old)) != nil { removed += 1 }
+            }
+            if (try? fm.contentsOfDirectory(atPath: appDir.path))?.isEmpty == true {
+                try? fm.removeItem(at: appDir)
+            }
+        }
+        return removed
+    }
 }

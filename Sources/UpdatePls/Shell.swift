@@ -5,7 +5,8 @@ struct ShellResult {
     var stdout: String
     var stderr: String
     var timedOut = false
-    var ok: Bool { status == 0 && !timedOut }
+    var cancelled = false
+    var ok: Bool { status == 0 && !timedOut && !cancelled }
     /// stdout + stderr with progress-bar redraws (\r) collapsed to their final state.
     var combined: String { Self.collapse([stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")) }
 
@@ -17,14 +18,44 @@ struct ShellResult {
 }
 
 enum Shell {
+    private final class CancelState: @unchecked Sendable {
+        let lock = NSLock()
+        var pid: pid_t?
+        var cancelled = false
+
+        func attach(_ pid: pid_t) -> Bool {
+            lock.lock()
+            let wasCancelled = cancelled
+            self.pid = pid
+            lock.unlock()
+            return wasCancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let pid = self.pid
+            lock.unlock()
+            if let pid { Shell.killTree(pid) }
+        }
+
+        var isCancelled: Bool { lock.withLock { cancelled } }
+    }
+
     /// Runs a process, optionally feeding `input` on stdin. `onOutput` gets stdout and stderr as they arrive.
-    /// After `timeout` seconds the process and everything it started are stopped.
+    /// After `timeout` seconds (or if the enclosing Swift Task is cancelled), the process and everything it started are stopped.
     static func run(_ launchPath: String, _ args: [String], input: String? = nil, timeout: TimeInterval = 60,
                     onOutput: (@Sendable (String) -> Void)? = nil) async -> ShellResult {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global().async {
-                cont.resume(returning: runSync(launchPath, args, input: input, timeout: timeout, onOutput: onOutput))
+        if Task.isCancelled { return ShellResult(status: -1, stdout: "", stderr: "Cancelled", cancelled: true) }
+        let cancelState = CancelState()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                DispatchQueue.global().async {
+                    cont.resume(returning: runSync(launchPath, args, input: input, timeout: timeout, cancelState: cancelState, onOutput: onOutput))
+                }
             }
+        } onCancel: {
+            cancelState.cancel()
         }
     }
 
@@ -43,7 +74,8 @@ enum Shell {
     }
 
     private static func runSync(_ launchPath: String, _ args: [String], input: String?, timeout: TimeInterval,
-                                onOutput: (@Sendable (String) -> Void)?) -> ShellResult {
+                                cancelState: CancelState, onOutput: (@Sendable (String) -> Void)?) -> ShellResult {
+        if cancelState.isCancelled { return ShellResult(status: -1, stdout: "", stderr: "Cancelled", cancelled: true) }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launchPath)
         p.arguments = args
@@ -68,6 +100,9 @@ enum Shell {
             err.fileHandleForReading.readabilityHandler = nil
             return ShellResult(status: -1, stdout: "", stderr: "Couldn't start \(launchPath): \(error.localizedDescription)")
         }
+        if cancelState.attach(p.processIdentifier) {
+            killTree(p.processIdentifier)
+        }
         if let input { try? inp.fileHandleForWriting.write(contentsOf: Data(input.utf8)) }
         try? inp.fileHandleForWriting.close()
         let lock = NSLock()
@@ -87,8 +122,9 @@ enum Shell {
         }
         sink.lock.lock(); let o = sink.out, e = sink.err; sink.lock.unlock()
         lock.lock(); let t = timedOut; lock.unlock()
+        let c = cancelState.isCancelled
         return ShellResult(status: p.terminationStatus, stdout: String(decoding: o, as: UTF8.self),
-                           stderr: String(decoding: e, as: UTF8.self), timedOut: t)
+                           stderr: String(decoding: e, as: UTF8.self), timedOut: t, cancelled: c)
     }
 
     /// Stops a process and all its descendants: TERM first, KILL after 3 seconds.

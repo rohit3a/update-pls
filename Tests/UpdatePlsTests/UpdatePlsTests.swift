@@ -50,7 +50,7 @@ final class UpdatePlsTests: XCTestCase {
         let p = Probe.parse(out)
         XCTAssertEqual(p.os, .mac)
         XCTAssertTrue(p.casks.contains("cursor"))
-        let items = Engine.buildItems(p, machine: .local, catalog: Catalog.bundled())
+        let items = Engine.buildItems(p, machine: .local, catalog: Catalog.bundled(), preferDirectDownloads: false)
         XCTAssertEqual(items.count, 3)
         XCTAssertEqual(items[0].method, .npm(bin: "/u/.local/bin/npm", prefix: "/u/.local", package: "@openai/codex", tag: "latest", writable: true))
         XCTAssertEqual(items[1].method, .selfUpdate(path: "/u/.local/bin/claude", args: "update"))
@@ -59,6 +59,11 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(items[2].running)
         XCTAssertEqual(items[2].saved, ["3.22.1", "3.21.0"], "saved versions, newest first, only this app's")
         XCTAssertEqual(items[2].arch, "arm64")
+
+        // With direct downloads preferred (the default), cask-installed apps still get APFS rollback and signature checks.
+        let directItems = Engine.buildItems(p, machine: .local, catalog: Catalog.bundled(), preferDirectDownloads: true)
+        XCTAssertEqual(directItems[2].method, .macDirect(appPath: "/Applications/Cursor.app", bundleID: "com.todesktop.x"))
+        XCTAssertTrue(directItems[2].supportsRollback)
     }
 
     /// apt apps are found, and updated by Update pls only where sudo needs no password.
@@ -1199,6 +1204,164 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertEqual(ItemRow.changedPart(of: "0.1.1-nightly.20261019.3373", from: "0.1.1-nightly.20261019.3360"), "3373")
         XCTAssertEqual(ItemRow.changedPart(of: "0.1.1-nightly.20261020.3380", from: "0.1.1-nightly.20261019.3360"), "20261020.3380")
         XCTAssertEqual(ItemRow.changedPart(of: "2.1.304", from: "2.1.303"), "2.1.304")
+    }
+
+    /// A CLI wrapper script that delegates directly to a macOS `.app` bundle (like T3 Code's bundled `t3`)
+    /// is detected as `.bundledWithApp` instead of failing verification on every Update all.
+    func testBundledAppCLIWrapperDetected() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("up-bundled-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let bin = root.appendingPathComponent("bin")
+        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
+        let wrapper = bin.appendingPathComponent("t3")
+        try """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo "t3 v0.1.12-nightly.20261123.5151"; exit 0; fi
+        app='/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code (Nightly)'
+        exec "$app" "$@"
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+
+        let script = Probe.unixPrelude(cachedPath: bin.path + ":/usr/bin:/bin") + Probe.unixFunctions + "up_cli t3 t3\n"
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "{\n" + script + "\n} </dev/null"]
+        p.standardOutput = out
+        try p.run()
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+
+        let parsed = Probe.parse(text)
+        XCTAssertEqual(parsed.clis.first?.bundledApp, "/Applications/T3 Code (Nightly).app")
+        XCTAssertFalse(parsed.resolvedPath.isEmpty)
+        let items = Engine.buildItems(parsed, machine: .local, catalog: Catalog.bundled())
+        let t3 = try XCTUnwrap(items.first { $0.defID == "t3" })
+        XCTAssertEqual(t3.method, .bundledWithApp(appPath: "/Applications/T3 Code (Nightly).app", appName: "T3 Code (Nightly)"))
+        XCTAssertFalse(t3.canUpdate)
+    }
+
+    /// Targeted single-item verification scripts parse cleanly for CLI, Mac app, and Linux deb items.
+    func testVerifyScriptsParseAndRun() throws {
+        let cat = Catalog.bundled()
+        let cliItem = Item(machine: .local, os: .mac, defID: "claude-code", name: "Claude Code", brand: "Claude",
+                           isApp: false, path: "/opt/homebrew/bin/claude", installed: "2.1.330", method: .selfUpdate(path: "/opt/homebrew/bin/claude", args: "update"))
+        let appItem = Item(machine: .local, os: .mac, defID: "cursor", name: "Cursor", brand: "Cursor",
+                           isApp: true, path: "/Applications/Cursor.app", installed: "3.31.11", method: .macDirect(appPath: "/Applications/Cursor.app", bundleID: "com.todesktop.x"))
+        let debItem = Item(machine: Machine(id: "linux", name: "linux"), os: .linux, defID: "cursor", name: "Cursor", brand: "Cursor",
+                           isApp: true, path: "cursor", installed: "3.31.11", method: .deb("cursor", passwordless: true))
+        for item in [cliItem, appItem, debItem] {
+            let script = Probe.verifyScript(for: item, catalog: cat, cachedPath: "/usr/bin:/bin")
+            XCTAssertFalse(script.contains("up_login_path"), "cached path skips login shell spawn")
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = ["-n", "-c", "{\n" + script + "\n} </dev/null"]
+            try p.run(); p.waitUntilExit()
+            XCTAssertEqual(p.terminationStatus, 0, script)
+        }
+    }
+
+    /// Cancelling a queued or running update stops it cleanly without marking it as failed.
+    @MainActor
+    func testCancelQueuedAndRunningJobs() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let model = AppModel(autostart: false)
+        var a = Item(machine: .local, os: .mac, defID: "a", name: "A", brand: "A", isApp: false, path: "/a",
+                     installed: "1.0", latest: LatestInfo(version: "2.0"), method: .bun(package: "a"))
+        a.state = .available
+        var b = a; b.defID = "b"; b.name = "B"; b.path = "/b"
+        model.items = [a, b]
+        model.perform = { _, _, r in
+            r.phase("Downloading")
+            let res = await Shell.run("/bin/sleep", ["30"], timeout: 60)
+            return res.cancelled ? .cancelledOutcome() : UpdateOutcome(ok: true, message: "Updated")
+        }
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [a, b]) }
+        model.enqueue([(a, .update), (b, .update)])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(model.canCancel(a))
+        XCTAssertTrue(model.canCancel(b))
+        // Cancel queued B first, then running A.
+        model.cancel(b)
+        XCTAssertNil(model.activity[b.key])
+        model.cancel(a)
+        for _ in 0..<60 where model.isBusy { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertNil(model.activity[a.key], "cancelled job clears its row cleanly")
+        XCTAssertEqual(model.failedCount, 0)
+    }
+
+    /// Multiple Mac app downloads run in parallel lanes, while `SwapGate` serializes swaps and `macSwapScript` stops ShipIt.
+    func testMacDirectAppsUseParallelLanesAndStopShipIt() {
+        let a = Item(machine: .local, os: .mac, defID: "claude-desktop", name: "Claude Desktop", brand: "Claude",
+                     isApp: true, path: "/Applications/Claude.app", installed: "1.0", method: .macDirect(appPath: "/Applications/Claude.app", bundleID: "com.anthropic.claudefordesktop"))
+        let b = Item(machine: .local, os: .mac, defID: "cursor", name: "Cursor", brand: "Cursor",
+                     isApp: true, path: "/Applications/Cursor.app", installed: "1.0", method: .macDirect(appPath: "/Applications/Cursor.app", bundleID: "com.todesktop.x"))
+        XCTAssertNotEqual(AppModel.lane(a), AppModel.lane(b), "direct Mac apps download in parallel lanes")
+        let swap = Engine.macSwapScript(app: a.path, bundleID: "com.anthropic.claudefordesktop", name: a.name, staged: "/tmp/x.app",
+                                        version: "2.0", stage: Engine.stagingPath(a), saved: Engine.savedPath(a), keep: 3)
+        XCTAssertTrue(swap.contains("up_stop_shipit"))
+        XCTAssertTrue(swap.contains("launchctl bootout"))
+        XCTAssertNotNil(Engine.releaseNotesURL(for: a, catalog: Catalog.bundled()))
+    }
+
+    /// Backup storage stats and pruning work cleanly in a sandboxed home directory.
+    func testBackupStatsAndPrune() throws {
+        let sandbox = try Sandbox()
+        let saved = sandbox.home.appendingPathComponent(Engine.backupsDir).appendingPathComponent("cursor")
+        for (idx, v) in ["1.0", "2.0", "3.0"].enumerated() {
+            let dir = saved.appendingPathComponent(v)
+            try sandbox.makeApp(at: dir.appendingPathComponent("Cursor.app"), version: v)
+            let date = Date(timeIntervalSinceNow: TimeInterval(idx * 60))
+            try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: dir.path)
+        }
+        let before = Engine.backupStats(home: sandbox.home)
+        XCTAssertEqual(before.apps, 1)
+        XCTAssertEqual(before.versions, 3)
+        XCTAssertGreaterThan(before.bytes, 0)
+        let removed = Engine.pruneBackups(keep: 1, home: sandbox.home)
+        XCTAssertEqual(removed, 2)
+        let after = Engine.backupStats(home: sandbox.home)
+        XCTAssertEqual(after.versions, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: saved.path), ["3.0"])
+    }
+
+    /// Open-app updates present an inline confirmation inside the popover when `askBeforeQuitting` is enabled.
+    @MainActor
+    func testInlineQuitConfirmationFlow() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let askBefore = UserDefaults.standard.object(forKey: "dontAskBeforeQuitting")
+        defer { UserDefaults.standard.set(askBefore, forKey: "dontAskBeforeQuitting") }
+        let model = AppModel(autostart: false)
+        model.askBeforeQuitting = true
+        var remoteApp = Item(machine: Machine(id: "srv", name: "srv"), os: .linux, defID: "cursor", name: "Cursor", brand: "Cursor",
+                             isApp: true, path: "cursor", installed: "1.0", latest: LatestInfo(version: "2.0"),
+                             method: .deb("cursor", passwordless: true), running: true, state: .available)
+        model.hosts = ["srv"]
+        model.disabledHosts = []
+        model.items = [remoteApp]
+        let ran = Box(false)
+        model.perform = { _, _, _ in ran.mutate { $0 = true }; return UpdateOutcome(ok: true, message: "Updated") }
+        let updatedRemote: Item = { var x = remoteApp; x.installed = "2.0"; x.state = .upToDate; return x }()
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .linux, state: .online), [updatedRemote]) }
+
+        model.update(model.items[0])
+        XCTAssertEqual(model.pendingQuit?.openNames, ["Cursor on srv"])
+        XCTAssertFalse(ran.value)
+
+        model.cancelPendingQuit()
+        XCTAssertNil(model.pendingQuit)
+        XCTAssertFalse(ran.value)
+
+        model.update(model.items[0])
+        model.confirmPendingQuit(dontAskAgain: false)
+        XCTAssertNil(model.pendingQuit)
+        for _ in 0..<40 where model.isBusy { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertTrue(ran.value)
     }
 
 }

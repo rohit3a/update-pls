@@ -58,6 +58,19 @@ enum SSHConfig {
         return t
     }
 
+    /// Resolves `ssh -G` targets off the main thread in parallel.
+    static func targetsAsync(_ aliases: [String]) async -> [String: String] {
+        guard !aliases.isEmpty else { return [:] }
+        return await withTaskGroup(of: (String, String).self) { g in
+            for a in aliases {
+                g.addTask { (a, target(a) ?? a) }
+            }
+            var out: [String: String] = [:]
+            for await (a, t) in g { out[a] = t }
+            return out
+        }
+    }
+
     /// The alias that last worked for each target, so a check starts with it.
     static var preferred: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: "preferredHosts") as? [String: String] ?? [:] }
@@ -82,7 +95,28 @@ enum SSHConfig {
 }
 
 enum Runner {
-    static let sshOptions = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+    /// Short per-user socket folder for SSH ControlMaster multiplexing (POSIX AF_UNIX limit is 104 bytes on macOS).
+    private static let controlDir: String = {
+        let dir = "/tmp/up-ssh-\(getuid())"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return dir
+    }()
+
+    static var sshOptions: [String] {
+        let dir = controlDir
+        if !FileManager.default.fileExists(atPath: dir) {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        return [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=4",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=\(dir)/%C",
+            "-o", "ControlPersist=120",
+        ]
+    }
 
     /// Reads a PowerShell script from stdin and runs it, so the script never touches the remote command line.
     static let psBootstrap: String = {

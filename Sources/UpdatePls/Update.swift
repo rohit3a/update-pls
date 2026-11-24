@@ -14,8 +14,38 @@ struct UpdateOutcome {
     /// False when nothing had to be replaced.
     var changed = true
     var timedOut = false
+    var cancelled = false
 
     static func fail(_ message: String, output: String = "") -> UpdateOutcome { UpdateOutcome(ok: false, message: message, output: output) }
+    static func cancelledOutcome(output: String = "") -> UpdateOutcome {
+        UpdateOutcome(ok: false, message: "Cancelled", output: output, changed: false, cancelled: true)
+    }
+}
+
+/// Serializes the brief quit + atomic-swap + reopen critical section per machine so multiple Mac apps can
+/// download, unpack, checksum and verify signatures in parallel without stepping on each other during swap.
+actor SwapGate {
+    static let shared = SwapGate()
+    private var busy: Set<String> = []
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func acquire(machineID: String) async {
+        while busy.contains(machineID) {
+            await withCheckedContinuation { cont in
+                waiters[machineID, default: []].append(cont)
+            }
+        }
+        busy.insert(machineID)
+    }
+
+    func release(machineID: String) {
+        busy.remove(machineID)
+        if var list = waiters[machineID], !list.isEmpty {
+            let next = list.removeFirst()
+            waiters[machineID] = list.isEmpty ? nil : list
+            next.resume()
+        }
+    }
 }
 
 /// Writes one update's output to its run file as it arrives and turns it into progress for the menu:
@@ -308,10 +338,15 @@ extension Engine {
             r.showLines = true
             r.phase("Installing \(version)")
             if let f = r.runFile { Log.appendRun(f, "$ \(cmd)\n") }
-            let res = await Runner.run(item.machine, os: item.os, script: Probe.unixPrelude + "set -e\n" + cmd + "\n", timeout: 900, onOutput: r.sink)
-            outcome = res.ok ? UpdateOutcome(ok: true, message: "Installed \(version)", output: res.combined, previous: item.installed)
-                             : .fail(failure(res), output: res.combined)
-            outcome.timedOut = res.timedOut
+            let prelude = Probe.unixPrelude(cachedPath: Engine.cachedPath(for: item.machine))
+            let res = await Runner.run(item.machine, os: item.os, script: prelude + "set -e\n" + cmd + "\n", timeout: 900, onOutput: r.sink)
+            if res.cancelled {
+                outcome = .cancelledOutcome(output: res.combined)
+            } else {
+                outcome = res.ok ? UpdateOutcome(ok: true, message: "Installed \(version)", output: res.combined, previous: item.installed)
+                                 : .fail(failure(res), output: res.combined)
+                outcome.timedOut = res.timedOut
+            }
         } else {
             outcome = .fail("This install can't switch versions")
         }
@@ -364,8 +399,9 @@ extension Engine {
         r.showLines = true
         r.phase("Updating with \(item.method.label)")
         if let f = r.runFile { Log.appendRun(f, "$ \(cmd)\n") }
-        let res = await Runner.run(item.machine, os: item.os, script: commandScript(item, cmd, relaunch: relaunch), timeout: 900, onOutput: r.sink)
+        let res = await Runner.run(item.machine, os: item.os, script: commandScript(item, cmd, relaunch: relaunch, cachedPath: Engine.cachedPath(for: item.machine)), timeout: 900, onOutput: r.sink)
         guard res.ok else {
+            if res.cancelled { return .cancelledOutcome(output: res.combined) }
             var o = UpdateOutcome.fail(failure(res), output: res.combined)
             o.timedOut = res.timedOut
             return o
@@ -374,17 +410,24 @@ extension Engine {
                              previous: item.supportsRollback ? item.installed : nil)
     }
 
-    static func commandScript(_ item: Item, _ cmd: String, relaunch: Bool) -> String {
+    static func commandScript(_ item: Item, _ cmd: String, relaunch: Bool, cachedPath: String? = nil) -> String {
         // apt would replace an open app's files under it. As with Mac apps, it is downloaded while the app keeps
         // running, then quit there, updated and opened again (whether or not the update worked).
         var before = "", after = ""
-        if case let .deb(pkg, _) = item.method {
+        var runCmd = cmd
+        if case let .deb(pkg, passwordless) = item.method {
             let p = Shell.q(pkg), on = item.machine.name
+            // Refresh apt lists at most once every 5 minutes during a batch so consecutive .deb updates don't
+            // repeat `apt-get update` (or run it twice for a single open app).
+            let aptRefresh = "if [ -z \"$(find /var/lib/apt/lists -maxdepth 1 -type f -name '*Release' -mmin -5 2>/dev/null | head -1)\" ]; then sudo -n apt-get update -q; fi"
+            if passwordless && runCmd.hasPrefix("sudo -n apt-get update -q && ") {
+                runCmd = aptRefresh + " && " + String(runCmd.dropFirst("sudo -n apt-get update -q && ".count))
+            }
             before = Probe.debFunctions + Probe.debQuitFunctions + """
             UP_RL=$(mktemp -d); UP_OPEN=0
             if up_deb_running \(p); then
               echo \(Shell.q("==> Downloading \(item.name)"))
-              if ! { sudo -n apt-get update -q && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y --download-only \(p); }; then
+              if ! { \(aptRefresh) && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y --download-only \(p); }; then
                 rm -rf "$UP_RL"; exit 1
               fi
               echo \(Shell.q("==> Quitting \(item.name) on \(on)"))
@@ -407,10 +450,11 @@ extension Engine {
 
             """
         }
+        let prelude = Probe.unixPrelude(cachedPath: cachedPath)
         return item.os == .windows
-            ? Probe.windowsPrelude + cmd + "\nexit $LASTEXITCODE\n"
-            : after.isEmpty ? Probe.unixPrelude + "set -e\n" + cmd + "\n"
-            : Probe.unixPrelude + before + "(\nset -e\n" + cmd + "\n)\nUP_ST=$?\n" + after + "exit $UP_ST\n"
+            ? Probe.windowsPrelude + runCmd + "\nexit $LASTEXITCODE\n"
+            : after.isEmpty ? prelude + "set -e\n" + runCmd + "\n"
+            : prelude + before + "(\nset -e\n" + runCmd + "\n)\nUP_ST=$?\n" + after + "exit $UP_ST\n"
     }
 
     // MARK: Mac apps
@@ -432,6 +476,13 @@ extension Engine {
         report() { echo "CURRENT	$(current)"; if app_running; then echo "RUNNING	1"; else echo "RUNNING	0"; fi; }
         # Saved copies keep the app's bundle ID; unregistered, macOS never opens one in place of the real app.
         up_unregister() { LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister; "$LSREG" -u "$1" >/dev/null 2>&1 || true; }
+        # Unload any leftover Squirrel ShipIt launchd job before replacing the app bundle, so launchd doesn't
+        # crash-loop ShipIt every 2 seconds after an external update replaces the app out from under it.
+        up_stop_shipit() {
+          if [ -n "$BID" ] && [ "$BID" != "unknown.bundle.id" ]; then
+            launchctl bootout "gui/$(id -u)/$BID.ShipIt" >/dev/null 2>&1 || true
+          fi
+        }
         # The main process of this app running from Update pls's saved copies instead of "$APP".
         saved_copy_pids() { ps -axo pid=,command= | grep -F "/Update pls/Backups/" | grep -F "/$(basename "$APP")/Contents/MacOS/$(basename "$APP" .app)" | grep -v grep | awk '{print $1}' || true; }
 
@@ -679,6 +730,7 @@ extension Engine {
         up_step \(Shell.q("Installing \(name) \(version)"))
         \(source)
         if app_running; then up_fail \(Shell.q("\(name) is open again; quit it and press Retry")); fi
+        up_stop_shipit
         mkdir -p "$SV"
         # Copies saved by Update pls 0.3 sit directly in the folder; file them under their version.
         if [ -d "$SV/$AN" ] && [ "$NEW" != "$SV/$AN" ]; then
@@ -827,6 +879,7 @@ extension Engine {
             return (res, fields(res))
         }
         func failed(_ res: ShellResult) -> UpdateOutcome {
+            if res.cancelled { return .cancelledOutcome(output: log) }
             var o = UpdateOutcome.fail(failure(res), output: log)
             o.timedOut = res.timedOut
             return o
@@ -860,11 +913,13 @@ extension Engine {
             if let local { Log.info("\(item.key): using the update \(name) already downloaded: \(local)") }
             var (s1, f1) = await step(macStageScript(app: app, bundleID: bid, name: name, url: url, info: info, stage: stage,
                                                      local: local, trust: trust), 3600)
+            if s1.cancelled || Task.isCancelled { await discard(); return .cancelledOutcome(output: log) }
             // The app's copy may be mid-way through being patched, or not what it seemed: download it after all.
             if local != nil, let url = info.url,
                !s1.ok || f1["STAGED"] == nil || Version.clean(f1["STAGED_VERSION"] ?? "") != Version.clean(target) {
                 Log.info("\(item.key): the update \(name) already downloaded didn't check out (\(s1.ok ? "version \(f1["STAGED_VERSION"] ?? "?")" : failure(s1))); downloading it")
                 (s1, f1) = await step(macStageScript(app: app, bundleID: bid, name: name, url: url, info: info, stage: stage, trust: trust), 3600)
+                if s1.cancelled || Task.isCancelled { await discard(); return .cancelledOutcome(output: log) }
             }
             guard s1.ok, let path = f1["STAGED"] else { return failed(s1) }
             // A feed can point at another build than it lists: never install an older one as an update.
@@ -886,6 +941,14 @@ extension Engine {
             wasRunning = f1["RUNNING"] == "1"
         }
 
+        if Task.isCancelled { await discard(); return .cancelledOutcome(output: log) }
+
+        // Only the brief quit + atomic-swap + reopen section is serialized per machine, so downloads run in parallel.
+        await SwapGate.shared.acquire(machineID: item.machine.id)
+        defer { Task { await SwapGate.shared.release(machineID: item.machine.id) } }
+
+        if Task.isCancelled { await discard(); return .cancelledOutcome(output: log) }
+
         // Whatever goes wrong from here, an app that was open is opened again (the old version is still in place).
         func giveUp(_ o: UpdateOutcome) async -> UpdateOutcome {
             await discard()
@@ -897,6 +960,7 @@ extension Engine {
             // Without it, an app that installs its own update on quit would leave nothing to roll back to.
             guard sc.ok else {
                 await discard()
+                if sc.cancelled { return .cancelledOutcome(output: log) }
                 return .fail("Couldn't keep a copy of \(name) for rollback, so it wasn't quit or updated: \(failure(sc))", output: log)
             }
             if let err = await quitApp(item, app: app, bundleID: bid, r, run: run, log: &log) {
@@ -945,26 +1009,36 @@ extension Engine {
         r.phase("Checking \(item.name)")
         let s0 = await run(macStateScript(app: item.path, bundleID: bid), 60, r.sink)
         log += s0.combined + "\n"
-        guard s0.ok else { return .fail(failure(s0), output: log) }
+        guard s0.ok else { return s0.cancelled ? .cancelledOutcome(output: log) : .fail(failure(s0), output: log) }
         let wasRunning = fields(s0)["RUNNING"] == "1"
         if wasRunning {
             if let err = await quitApp(item, app: item.path, bundleID: bid, r, run: run, log: &log) { return .fail(err, output: log) }
             let w = await run(macWaitUpdaterScript(app: item.path, bundleID: bid, name: item.name), 400, r.sink)
             log += w.combined + "\n"
-            guard w.ok else { return .fail(failure(w), output: log) }
+            guard w.ok else { return w.cancelled ? .cancelledOutcome(output: log) : .fail(failure(w), output: log) }
             if let cur = fields(w)["CURRENT"], !cur.isEmpty, !target.isEmpty, !Version.isNewer(target, than: cur) {
                 if relaunch && fields(w)["RUNNING"] != "1" { await reopen(item, app: item.path, bundleID: bid, r, run: run) }
                 return UpdateOutcome(ok: true, message: "\(item.name) installed its own update to \(cur)", output: log, installed: cur)
             }
         }
+        // Unload any lingering Squirrel ShipIt launchd job before Homebrew deletes and moves the app bundle.
+        if !bid.isEmpty {
+            _ = await run("launchctl bootout \"gui/$(id -u)/\"\(Shell.q(bid + ".ShipIt")) >/dev/null 2>&1 || true\n", 15, nil)
+        }
         r.showLines = true
         r.phase("Updating with Homebrew")
         if let f = r.runFile { Log.appendRun(f, "$ \(cmd)\n") }
-        let res = await Runner.run(item.machine, os: .mac, script: Probe.unixPrelude + "set -e\n" + cmd + "\n", timeout: 1800, onOutput: r.sink)
+        let prelude = Probe.unixPrelude(cachedPath: Engine.cachedPath(for: item.machine))
+        let res = await Runner.run(item.machine, os: .mac, script: prelude + "set -e\n" + cmd + "\n", timeout: 1800, onOutput: r.sink)
         log += res.combined + "\n"
         r.showLines = false
         if relaunch && wasRunning { await reopen(item, app: item.path, bundleID: bid, r, run: run) }
-        guard res.ok else { var o = UpdateOutcome.fail(failure(res), output: log); o.timedOut = res.timedOut; return o }
+        guard res.ok else {
+            if res.cancelled { return .cancelledOutcome(output: log) }
+            var o = UpdateOutcome.fail(failure(res), output: log)
+            o.timedOut = res.timedOut
+            return o
+        }
         return UpdateOutcome(ok: true, message: "Updated", output: log)
     }
 
@@ -973,6 +1047,7 @@ extension Engine {
     /// The one line that says why a script failed: our own UPFAIL message (with the tool's error when it has one),
     /// else the most telling error line, else the last thing printed.
     static func failure(_ r: ShellResult) -> String {
+        if r.cancelled { return "Cancelled" }
         if r.timedOut { return "Timed out" }
         func lines(_ s: String) -> [String] {
             ShellResult.collapse(s).split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }

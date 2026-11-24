@@ -3,6 +3,8 @@ import Foundation
 struct CLIRecord {
     var id, binary, path, realPath, versionOutput, package, packageVersion, npmBin: String
     var writable: Bool
+    /// When the CLI is a wrapper script that execs a macOS `.app` bundle (e.g. T3 Code's bundled CLI), that app's path.
+    var bundledApp: String = ""
 }
 
 struct AppRecord {
@@ -20,6 +22,8 @@ struct WingetRow { var name, id, version, available: String }
 struct ProbeResult {
     var os: OSKind
     var arch = ""
+    /// Resolved login PATH from the probe, cached per machine so updates and verifications skip spawning a login shell.
+    var resolvedPath: String = ""
     var clis: [CLIRecord] = []
     var apps: [AppRecord] = []
     var casks: Set<String> = []
@@ -37,28 +41,41 @@ struct ProbeResult {
 
 enum Probe {
     /// Shell setup shared by every POSIX script: borrow the user's login PATH (nvm, bun, brew, ...).
-    static let unixPrelude = #"""
-    export LC_ALL=C
-    up_login_path() {
-      "${SHELL:-/bin/bash}" -lic 'printf "\n__UPP__%s\n" "$PATH"' </dev/null 2>/dev/null &
-      up_pid=$!
-      ( sleep 8; kill $up_pid ) >/dev/null 2>&1 &
-      up_k=$!
-      wait $up_pid 2>/dev/null
-      kill $up_k 2>/dev/null
-    }
-    UP_P=$(up_login_path | sed -n 's/^__UPP__//p' | tail -1)
-    export PATH="${UP_P:+$UP_P:}$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+    static let unixPrelude = unixPrelude(cachedPath: nil)
+
+    /// POSIX prelude that reuses a cached login PATH when available instead of spawning a slow interactive login shell.
+    static func unixPrelude(cachedPath: String?) -> String {
+        let pathSetup: String
+        if let cachedPath, !cachedPath.isEmpty {
+            pathSetup = "export PATH=\(Shell.q(cachedPath))\n"
+        } else {
+            pathSetup = #"""
+            up_login_path() {
+              "${SHELL:-/bin/bash}" -lic 'printf "\n__UPP__%s\n" "$PATH"' </dev/null 2>/dev/null &
+              up_pid=$!
+              ( sleep 8; kill $up_pid ) >/dev/null 2>&1 &
+              up_k=$!
+              wait $up_pid 2>/dev/null
+              kill $up_k 2>/dev/null
+            }
+            UP_P=$(up_login_path | sed -n 's/^__UPP__//p' | tail -1)
+            export PATH="${UP_P:+$UP_P:}$HOME/.local/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.opencode/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+            """#
+        }
+        return "export LC_ALL=C\n" + pathSetup + #"""
     # Homebrew's curl has no stall limit, so one frozen download held a machine's whole queue for up to 30 minutes.
     # Abort a download that moves under 1 KB/s for 60 seconds; brew's curl then retries and resumes it.
-    # The config file lives only while brew runs, and brew runs as before if there's nowhere to write it.
-    if command -v brew >/dev/null 2>&1 && [ -z "${HOMEBREW_CURLRC:-}" ]; then
+    # Also skip Homebrew auto-update/env-hints since Update pls already resolved the latest version via the API.
+    if command -v brew >/dev/null 2>&1; then
       brew() {
-        up_rc=$(mktemp 2>/dev/null) || { command brew "$@"; return; }
-        printf 'speed-limit = 1024\nspeed-time = 60\n' > "$up_rc"
-        if HOMEBREW_CURLRC="$up_rc" command brew "$@"; then up_r=0; else up_r=$?; fi
-        rm -f "$up_rc"
-        return $up_r
+        if [ -z "${HOMEBREW_CURLRC:-}" ] && up_rc=$(mktemp 2>/dev/null); then
+          printf 'speed-limit = 1024\nspeed-time = 60\n' > "$up_rc"
+          if HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_CURLRC="$up_rc" command brew "$@"; then up_r=0; else up_r=$?; fi
+          rm -f "$up_rc"
+          return $up_r
+        fi
+        HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 command brew "$@"
       }
     fi
     # macOS has no `timeout`: there the command is stopped by a sleeper instead, so nothing can hang a check.
@@ -74,6 +91,7 @@ enum Probe {
     }
 
     """#
+    }
 
     /// `up_deb_running pkg`: whether a desktop app installed by that apt package is open. It looks for programs
     /// right in the package's own folder (/usr/lib/chatgpt, /opt/Grok Bot, ...), not helpers in subfolders.
@@ -156,7 +174,11 @@ enum Probe {
           esac
           [ -n "$v" ] || v=$(up_to 20 "$p" --version </dev/null 2>&1 | head -3 | tr '\t\n\r' '   ')
         fi
-        printf 'CLI\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$b" "$p" "$r" "$v" "$pkg" "$pv" "$nb" "$w"
+        ba=""
+        if [ -f "$r" ] && [ "$(head -c 2 "$r" 2>/dev/null)" = "#!" ]; then
+          ba=$(grep -oE "/([^'\"]*/)?Applications/[^'\"]+\.app/Contents/MacOS/" "$r" 2>/dev/null | sed 's|/Contents/MacOS/$||' | head -1)
+        fi
+        printf 'CLI\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$b" "$p" "$r" "$v" "$pkg" "$pv" "$nb" "$w" "$ba"
         return
       done
     }
@@ -185,6 +207,7 @@ enum Probe {
       printf 'DEB\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$v" "$c" "$r"
     }
     printf 'OS\t%s\t%s\n' "$(uname -s)" "$(uname -m)"
+    printf 'PATH\t%s\n' "$PATH"
     if command -v brew >/dev/null 2>&1; then
       printf 'BREW\t%s\n' "$(command -v brew)"
       printf 'CASKS\t%s\n' "$(brew list --cask 2>/dev/null | tr '\n' ' ')"
@@ -192,8 +215,96 @@ enum Probe {
 
     """#
 
-    static func unixScript(_ c: Catalog) -> String {
-        var s = unixPrelude + debFunctions + unixFunctions
+    /// Targeted single-item verification script: checks only the tool that just finished updating instead of
+    /// scanning every tool on the machine.
+    static func verifyScript(for item: Item, catalog: Catalog, cachedPath: String?) -> String {
+        var s = unixPrelude(cachedPath: cachedPath) + debFunctions + #"""
+        up_real() { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"; }
+        up_pkg() {
+          n=$(command -v node 2>/dev/null)
+          if [ -n "$n" ]; then "$n" -e 'const j=require(process.argv[1]);console.log(j.name+"|"+j.version)' "$1" 2>/dev/null
+          else echo "$(up_jfield name "$1")|$(up_jfield version "$1")"; fi
+        }
+        up_jfield() { sed -n "s/^  \"$1\": *\"\([^\"]*\)\".*/\1/p" "$2" | head -1; }
+        printf 'OS\t%s\t%s\n' "$(uname -s)" "$(uname -m)"
+        printf 'PATH\t%s\n' "$PATH"
+
+        """#
+        if !item.isApp, let def = catalog.clis.first(where: { $0.id == item.defID }) {
+            s += #"""
+            up_cli() {
+              id=$1; shift
+              for b in "$@"; do
+                p=$(command -v "$b" 2>/dev/null) || continue
+                case "$p" in /*) ;; *) continue ;; esac
+                r=$(up_real "$p")
+                v=""; pkg=""; pv=""; nb=""; w=0
+                case "$r" in */node_modules/*)
+                  d=$(dirname "$r")
+                  while [ "$d" != "/" ] && [ ! -f "$d/package.json" ]; do d=$(dirname "$d"); done
+                  if [ -f "$d/package.json" ]; then
+                    IFS='|' read -r pkg pv <<< "$(up_pkg "$d/package.json")"
+                    if [ -x "$(dirname "$p")/npm" ]; then nb="$(dirname "$p")/npm"; else nb=$(command -v npm 2>/dev/null); fi
+                    [ -w "$(dirname "$d")" ] && w=1
+                  fi ;;
+                esac
+                if [ -z "$pv" ]; then
+                  case "$r" in */versions/[0-9]*.*)
+                    t=${r##*/versions/}
+                    case "$t" in */*/*) ;; *) v=${t%%/*} ;; esac ;;
+                  esac
+                  [ -n "$v" ] || v=$(up_to 20 "$p" --version </dev/null 2>&1 | head -3 | tr '\t\n\r' '   ')
+                fi
+                ba=""
+                if [ -f "$r" ] && [ "$(head -c 2 "$r" 2>/dev/null)" = "#!" ]; then
+                  ba=$(grep -oE "/([^'\"]*/)?Applications/[^'\"]+\.app/Contents/MacOS/" "$r" 2>/dev/null | sed 's|/Contents/MacOS/$||' | head -1)
+                fi
+                printf 'CLI\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$b" "$p" "$r" "$v" "$pkg" "$pv" "$nb" "$w" "$ba"
+                return
+              done
+            }
+
+            """#
+            s += "up_cli " + ([def.id] + def.binaries).map(Shell.q).joined(separator: " ") + "\n"
+        } else if item.os == .mac, let def = catalog.apps.first(where: { $0.id == item.defID }),
+                  let variant = def.mac?.first(where: { item.path.hasSuffix("/\($0.app).app") }) {
+            if case let .cask(token) = item.method {
+                s += "if command -v brew >/dev/null 2>&1; then printf 'BREW\\t%s\\n' \"$(command -v brew)\"; printf 'CASKS\\t%s\\n' \(Shell.q(token)); fi\n"
+            }
+            s += """
+            UP_PS=$(ps -axo command= 2>/dev/null)
+            a=\(Shell.q(item.path))
+            if [ -d "$a" ]; then
+              v=$(defaults read "$a/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+              bid=$(defaults read "$a/Contents/Info" CFBundleIdentifier 2>/dev/null)
+              run=0
+              printf '%s\\n' "$UP_PS" | grep -F "$a/Contents/MacOS/" >/dev/null && run=1
+              printf 'APP\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \(Shell.q(def.id)) \(Shell.q(variant.app)) "$a" "$v" "$bid" "$run"
+              for s in "$HOME/Library/Application Support/Update pls/Backups/\(def.id)"/*/\(Shell.q(variant.app + ".app")) "$HOME/Library/Application Support/Update pls/Backups/\(def.id)"/\(Shell.q(variant.app + ".app")); do
+                [ -d "$s" ] && printf 'SAVED\\t%s\\t%s\\t%s\\n' \(Shell.q(def.id)) \(Shell.q(variant.app)) "$(defaults read "$s/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
+              done
+            fi
+
+            """
+        } else if case let .deb(pkg, passwordless) = item.method {
+            if passwordless { s += "printf 'SUDO\\t1\\n'\n" }
+            s += """
+            v=$(dpkg-query -W -f='${Version}' \(Shell.q(pkg)) 2>/dev/null) || true
+            if [ -n "$v" ]; then
+              c=$(apt-cache policy \(Shell.q(pkg)) 2>/dev/null | sed -n 's/^ *Candidate: *//p')
+              if [ -z "$c" ] || [ "$c" = "(none)" ] || ! dpkg --compare-versions "$c" gt "$v"; then c=$v; fi
+              if up_deb_running \(Shell.q(pkg)); then r=1; else r=0; fi
+              printf 'DEB\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \(Shell.q(item.defID)) \(Shell.q(pkg)) "$v" "$c" "$r"
+            fi
+
+            """
+        }
+        s += "true\n"
+        return s
+    }
+
+    static func unixScript(_ c: Catalog, cachedPath: String? = nil) -> String {
+        var s = unixPrelude(cachedPath: cachedPath) + debFunctions + unixFunctions
         // Each tool is read at the same time (a --version or apt-cache can take seconds), into its own file,
         // and the files are printed in order at the end. The folder must really take writes: on a full disk or
         // quota (a tmpfs /tmp with usrquota) each file would come back empty and the tools would silently go
@@ -292,11 +403,13 @@ enum Probe {
             case "OS" where f.count >= 3:
                 r.os = f[1] == "Darwin" ? .mac : f[1] == "Windows" ? .windows : .linux
                 r.arch = f[2]
+            case "PATH" where f.count >= 2: r.resolvedPath = f[1]
             case "BREW": r.hasBrew = true
             case "CASKS" where f.count >= 2: r.casks = Set(f[1].split(separator: " ").map(String.init))
             case "CLI" where f.count >= 10:
                 r.clis.append(CLIRecord(id: f[1], binary: f[2], path: f[3], realPath: f[4], versionOutput: f[5],
-                                        package: f[6], packageVersion: f[7], npmBin: f[8], writable: f[9] == "1"))
+                                        package: f[6], packageVersion: f[7], npmBin: f[8], writable: f[9] == "1",
+                                        bundledApp: f.count >= 11 ? f[10] : ""))
             case "APP" where f.count >= 7:
                 r.apps.append(AppRecord(id: f[1], appName: f[2], path: f[3], version: f[4], bundleID: f[5], running: f[6] == "1"))
             case "SAVED" where f.count >= 4 && !f[3].isEmpty:

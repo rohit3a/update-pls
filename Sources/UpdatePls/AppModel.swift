@@ -3,6 +3,26 @@ import Foundation
 import ServiceManagement
 import UserNotifications
 
+/// Caches `NSWorkspace.shared.icon(forFile:)` so SwiftUI row redraws never repeatedly hit LaunchServices/disk,
+/// and shares local Mac app icons by `defID` so remote machines also show real app icons.
+@MainActor
+enum AppIconCache {
+    private static var byPath: [String: NSImage] = [:]
+    private static var byDefID: [String: NSImage] = [:]
+
+    static func icon(for item: Item) -> NSImage? {
+        guard item.isApp else { return nil }
+        if item.machine.isLocal {
+            if let hit = byPath[item.path] { return hit }
+            let img = NSWorkspace.shared.icon(forFile: item.path)
+            byPath[item.path] = img
+            byDefID[item.defID] = img
+            return img
+        }
+        return byDefID[item.defID]
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     /// An update's progress and result, kept apart from the scanned items so a re-check never wipes it.
@@ -23,25 +43,32 @@ final class AppModel: ObservableObject {
 
     enum CheckReason: String { case startup, manual, background }
 
+    /// Inline confirmation state when an update needs to quit one or more open apps.
+    struct PendingQuit: Equatable {
+        let targets: [Item]
+        let openNames: [String]
+    }
+
     @Published var statuses: [MachineStatus] = []
-    @Published var items: [Item] = []
+    @Published var items: [Item] = [] {
+        didSet { rebuildGroupCache() }
+    }
     @Published var isChecking = false
     @Published var lastCheck: Date?
     @Published var selfLatest: String?
     @Published var selfUpdating = false
     @Published var selfError: String?
-    @Published var hosts: [String] = SSHConfig.hosts() {
-        didSet { if hosts != oldValue { hostTargets = SSHConfig.targets(hosts) } }
-    }
+    @Published var hosts: [String] = SSHConfig.hosts()
     /// Where each alias connects ("user@host:port"), so aliases for one machine show as one.
-    private(set) var hostTargets: [String: String] = SSHConfig.targets(SSHConfig.hosts())
+    @Published private(set) var hostTargets: [String: String] = [:]
     /// Update progress and results by item key.
     @Published var activity: [String: Activity] = [:]
     /// Each tool's last update output, by item key.
     @Published var runFiles: [String: URL] = [:]
-    /// Published versions each tool can be switched to, by item key (looked up when its row is first hovered).
+    /// Published versions each tool can be switched to, by item key.
     @Published var versionLists: [String: [String]] = [:]
     private var loadingVersions: Set<String> = []
+    private var hoverTasks: [String: Task<Void, Never>] = [:]
     @Published var disabledHosts: Set<String> {
         didSet { UserDefaults.standard.set(Array(disabledHosts), forKey: "disabledHosts") }
     }
@@ -51,7 +78,10 @@ final class AppModel: ObservableObject {
     }
     /// Tools (`machine/tool`) left out of the list altogether.
     @Published var hidden: Set<String> {
-        didSet { UserDefaults.standard.set(Array(hidden), forKey: "hiddenTools") }
+        didSet {
+            UserDefaults.standard.set(Array(hidden), forKey: "hiddenTools")
+            rebuildGroupCache()
+        }
     }
     /// The version each tool (`machine/tool`) was on before Update pls last updated it, for rollback.
     @Published var previous: [String: String] {
@@ -63,6 +93,28 @@ final class AppModel: ObservableObject {
     @Published var askBeforeQuitting: Bool {
         didSet { UserDefaults.standard.set(!askBeforeQuitting, forKey: "dontAskBeforeQuitting") }
     }
+    /// Prefer direct downloads over Homebrew Cask for Mac apps (enables APFS rollback, signature checks, ShipIt safety).
+    @Published var preferDirectDownloads: Bool {
+        didSet {
+            UserDefaults.standard.set(!preferDirectDownloads, forKey: "useHomebrewForApps")
+            if oldValue != preferDirectDownloads, !isBusy, !isChecking, lastCheck != nil {
+                Task { await checkAll(.manual) }
+            }
+        }
+    }
+    @Published var notificationsEnabled: Bool {
+        didSet { UserDefaults.standard.set(!notificationsEnabled, forKey: "disableNotifications") }
+    }
+    /// Inline quit confirmation shown inside the popover instead of a modal alert.
+    @Published var pendingQuit: PendingQuit?
+    /// Batch progress counters for the header while updates are running.
+    @Published var batchTotal: Int = 0
+    @Published var batchCompleted: Int = 0
+    /// Local rollback backup usage shown in Settings.
+    @Published var backupBytes: Int64 = 0
+    @Published var backupVersions: Int = 0
+    @Published var backupApps: Int = 0
+    @Published var isCleaningBackups = false
 
     /// How a job runs and how a machine is re-checked afterwards; tests swap these out.
     var perform: (Item, Job, Reporter) async -> UpdateOutcome = { item, job, r in
@@ -71,8 +123,11 @@ final class AppModel: ObservableObject {
         case let .install(v, source): await Engine.install(item, version: v, from: source, relaunch: true, reporter: r)
         }
     }
+    private var customScan = false
     var scan: @Sendable (Machine, Catalog, LatestResolver, [String: LatestInfo]) async -> (MachineStatus, [Item]) = { m, c, r, known in
         await Engine.check(m, catalog: c, resolver: r, known: known)
+    } {
+        didSet { customScan = true }
     }
 
     private var scheduler: NSBackgroundActivityScheduler?
@@ -80,10 +135,14 @@ final class AppModel: ObservableObject {
     /// Jobs waiting, per machine, in the order they were queued. Each machine works through them in lanes
     /// (see `lane(_:)`): one job at a time per lane, lanes and machines in parallel.
     private var pending: [Machine: [(Item, Job)]] = [:]
+    /// Active tasks by item key so running jobs can be cancelled cleanly.
+    private var runningTasks: [String: Task<UpdateOutcome, Never>] = [:]
     struct Lane: Hashable { let machine: Machine; let name: String }
     /// When each running job started and last showed progress, by item key.
     private var runStarted: [String: Date] = [:]
     private var lastProgress: [String: Date] = [:]
+    /// Cached brand-grouped items per machine id, rebuilt only when `items` or `hidden` change.
+    private var groupCache: [String: [(brand: String, items: [Item])]] = [:]
     /// Tools whose updater refused to run until someone signs in to it (Cursor Agent). Update all leaves them
     /// out, so they don't fail every time, until they update.
     @Published var waitingForSignIn: Set<String> {
@@ -113,14 +172,17 @@ final class AppModel: ObservableObject {
         waitingForSignIn = Set(UserDefaults.standard.stringArray(forKey: "waitingForSignIn") ?? [])
         notified = Set(UserDefaults.standard.stringArray(forKey: "notifiedUpdates") ?? [])
         askBeforeQuitting = !UserDefaults.standard.bool(forKey: "dontAskBeforeQuitting")
+        preferDirectDownloads = !UserDefaults.standard.bool(forKey: "useHomebrewForApps")
+        notificationsEnabled = !UserDefaults.standard.bool(forKey: "disableNotifications")
         let h = UserDefaults.standard.double(forKey: "intervalHours")
         intervalHours = h > 0 ? h : 3
         guard autostart else { return }
-        Log.info("Update pls \(SelfUpdate.current) started on macOS \(ProcessInfo.processInfo.operatingSystemVersionString); "
-                 + "hosts: \(machines.map(\.id).joined(separator: ", ")); log: \(Log.file.path)")
         if canNotify { UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge]) { _, _ in } }
         scheduleChecks()
         Task {
+            hostTargets = await SSHConfig.targetsAsync(hosts)
+            Log.info("Update pls \(SelfUpdate.current) started on macOS \(ProcessInfo.processInfo.operatingSystemVersionString); "
+                     + "hosts: \(machines.map(\.id).joined(separator: ", ")); log: \(Log.file.path)")
             let restored = await Engine.recoverInterruptedSwaps()
             if !restored.isEmpty {
                 let content = UNMutableNotificationContent()
@@ -129,6 +191,7 @@ final class AppModel: ObservableObject {
                 post(content)
             }
             await checkAll(.startup)
+            refreshBackupStats()
         }
     }
 
@@ -146,11 +209,27 @@ final class AppModel: ObservableObject {
     /// What Update all would start now (leaves out anything already queued or running).
     var updatable: [Item] { pendingUpdates.filter { !isActive($0) } }
 
+    /// What "Update" for one machine would start now.
+    func updatable(for m: Machine) -> [Item] { updatable.filter { $0.machine == m } }
+
     var isBusy: Bool { !workers.isEmpty || activity.values.contains(where: \.isActive) }
     var activeCount: Int { activity.values.filter(\.isActive).count }
+    var failedCount: Int {
+        activity.values.filter { if case .failed = $0 { true } else { false } }.count
+    }
     func isActive(_ item: Item) -> Bool { activity[item.key]?.isActive ?? false }
 
-    /// "Cursor on my-server" for a hidden tool's key, for Settings.
+    /// True if this item is queued or running in a cancellable phase (never during the 1-second atomic swap).
+    func canCancel(_ item: Item) -> Bool {
+        switch activity[item.key] {
+        case .queued?: return true
+        case let .running(phase, _)?:
+            return !phase.hasPrefix("Installing ") && !phase.hasPrefix("Reopening ")
+        default: return false
+        }
+    }
+
+    /// "Cursor on my-server" for a hidden/skipped tool's key, for Settings.
     func label(forKey key: String) -> String {
         guard let i = items.first(where: { $0.key == key }) else { return key }
         return i.machine.isLocal ? i.name : "\(i.name) on \(i.machine.name)"
@@ -167,16 +246,100 @@ final class AppModel: ObservableObject {
         History.clearHold(item.key)
     }
 
+    func toggleExcluded(key: String) {
+        if excluded.contains(key) { excluded.remove(key) } else { excluded.insert(key) }
+        History.clearHold(key)
+    }
+
     var selfUpdateAvailable: Bool { selfLatest.map { Version.isNewer($0, than: SelfUpdate.current) } ?? false }
 
     /// Badge count in the menu bar: tool updates plus Update pls itself.
     var updateCount: Int { pendingUpdates.count + (selfUpdateAvailable ? 1 : 0) }
 
+    /// Total visible tools across enabled machines.
+    var visibleToolCount: Int {
+        let on = Set(machines)
+        return items.filter { on.contains($0.machine) && !hidden.contains($0.key) }.count
+    }
+
+    private func rebuildGroupCache() {
+        var next: [String: [(brand: String, items: [Item])]] = [:]
+        let byMachine = Dictionary(grouping: items.filter { !hidden.contains($0.key) }, by: { $0.machine.id })
+        for (mid, list) in byMachine {
+            next[mid] = Dictionary(grouping: list, by: \.brand)
+                .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+                .map { (brand: $0.key, items: $0.value.sorted { ($0.isApp ? 1 : 0, $0.name) < ($1.isApp ? 1 : 0, $1.name) }) }
+        }
+        groupCache = next
+    }
+
     /// A machine's items grouped by brand (Claude, OpenAI, Google, ...), brands in alphabetical order.
     func groups(for m: Machine) -> [(brand: String, items: [Item])] {
-        Dictionary(grouping: items.filter { $0.machine == m && !hidden.contains($0.key) }, by: \.brand)
-            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
-            .map { (brand: $0.key, items: $0.value.sorted { ($0.isApp ? 1 : 0, $0.name) < ($1.isApp ? 1 : 0, $1.name) }) }
+        groupCache[m.id] ?? []
+    }
+
+    /// True if an item should appear in the primary/actionable section (has an update, is active, or failed/just finished).
+    func isActionable(_ item: Item) -> Bool {
+        if let a = activity[item.key] {
+            switch a {
+            case .queued, .running, .checking, .failed, .done: return true
+            }
+        }
+        return item.state == .available
+    }
+
+    /// Splits a machine's visible items into actionable (updates/active/errors) and up-to-date groups.
+    func partitionedGroups(for m: Machine) -> (actionable: [(brand: String, items: [Item])], upToDate: [(brand: String, items: [Item])]) {
+        let all = groups(for: m)
+        var act: [(brand: String, items: [Item])] = []
+        var ok: [(brand: String, items: [Item])] = []
+        for g in all {
+            let a = g.items.filter { isActionable($0) }
+            let u = g.items.filter { !isActionable($0) }
+            if !a.isEmpty { act.append((g.brand, a)) }
+            if !u.isEmpty { ok.append((g.brand, u)) }
+        }
+        return (act, ok)
+    }
+
+    func releaseNotesURL(for item: Item) -> URL? {
+        Engine.releaseNotesURL(for: item, catalog: Catalog.load())
+    }
+
+    // MARK: Backups
+
+    func refreshBackupStats() {
+        Task.detached(priority: .utility) {
+            let stats = Engine.backupStats()
+            await MainActor.run {
+                self.backupBytes = stats.bytes
+                self.backupVersions = stats.versions
+                self.backupApps = stats.apps
+            }
+        }
+    }
+
+    func cleanBackups(keep: Int) {
+        guard !isCleaningBackups else { return }
+        isCleaningBackups = true
+        Task.detached(priority: .utility) {
+            let removed = Engine.pruneBackups(keep: keep)
+            let stats = Engine.backupStats()
+            await MainActor.run {
+                self.backupBytes = stats.bytes
+                self.backupVersions = stats.versions
+                self.backupApps = stats.apps
+                self.isCleaningBackups = false
+                if removed > 0 { Log.info("pruned \(removed) old rollback backup(s)") }
+            }
+        }
+    }
+
+    var backupSummary: String {
+        guard backupVersions > 0 else { return "None stored" }
+        let fmt = ByteCountFormatter()
+        fmt.countStyle = .file
+        return "\(fmt.string(fromByteCount: backupBytes)) (\(backupVersions) \(backupVersions == 1 ? "copy" : "copies") across \(backupApps) \(backupApps == 1 ? "app" : "apps"))"
     }
 
     // MARK: Checking
@@ -207,7 +370,13 @@ final class AppModel: ObservableObject {
         isChecking = true
         let start = Date(), asleep = SleepClock.asleep
         Log.info("checking all machines (\(reason.rawValue))")
-        hosts = SSHConfig.hosts()
+        let latestHosts = SSHConfig.hosts()
+        if latestHosts != hosts || hostTargets.isEmpty {
+            hosts = latestHosts
+            if !customScan {
+                hostTargets = await SSHConfig.targetsAsync(latestHosts)
+            }
+        }
         // The command line may have recorded versions or skips since this app started.
         previous = History.previous
         excluded = History.excluded
@@ -215,6 +384,9 @@ final class AppModel: ObservableObject {
         let resolver = LatestResolver()
         let machines = machines
         let scan = scan
+        let useCustomScan = customScan
+        let preferDirect = preferDirectDownloads
+        let refreshPath = (reason == .manual || reason == .startup)
         scanning = Set(machines)
         async let selfLatest = SelfUpdate.latest()
         statuses = machines.map { m in
@@ -224,7 +396,13 @@ final class AppModel: ObservableObject {
         }
         await withTaskGroup(of: (MachineStatus, [Item]).self) { group in
             for m in machines {
-                group.addTask { await scan(m, catalog, resolver, [:]) }
+                group.addTask {
+                    if useCustomScan {
+                        return await scan(m, catalog, resolver, [:])
+                    }
+                    return await Engine.check(m, catalog: catalog, resolver: resolver, known: [:],
+                                              preferDirectDownloads: preferDirect, forcePathRefresh: refreshPath)
+                }
             }
             for await (status, found) in group {
                 apply(status, found)
@@ -283,21 +461,66 @@ final class AppModel: ObservableObject {
         if !waitingForSignIn.isDisjoint(with: current) { waitingForSignIn.subtract(current) }
     }
 
+    /// Merges one targeted single-item verification result into `items`.
+    private func applySingle(_ status: MachineStatus, _ fresh: Item?) {
+        let m = status.machine
+        if let i = statuses.firstIndex(where: { $0.machine == m }) { statuses[i] = status }
+        guard case .online = status.state, var fresh else { return }
+        if fresh.latest == nil, let old = items.first(where: { $0.key == fresh.key })?.latest {
+            fresh.latest = old
+            fresh.state = Engine.state(fresh)
+        }
+        if let idx = items.firstIndex(where: { $0.key == fresh.key }) {
+            items[idx] = fresh
+        } else {
+            items.append(fresh)
+        }
+        if fresh.state != .available { waitingForSignIn.remove(fresh.key) }
+    }
+
     // MARK: Updating
 
     func update(_ item: Item) {
         // Jobs finish one by one now, so a press can arrive with a row's old copy just after its update ended:
         // only what the latest check says is still waiting gets queued.
         let item = items.first { $0.key == item.key } ?? item
-        guard item.canUpdate, item.state == .available, !isActive(item), confirmQuit([item]) else { return }
-        enqueue([(item, .update)])
+        guard item.canUpdate, item.state == .available, !isActive(item) else { return }
+        requestStart([item])
     }
 
     func updateAll() {
         let targets = updatable
-        guard !targets.isEmpty, confirmQuit(targets) else { return }
-        Log.info("Update all: \(targets.map(\.key).joined(separator: ", "))")
+        guard !targets.isEmpty else { return }
+        requestStart(targets, logAll: true)
+    }
+
+    func updateMachine(_ m: Machine) {
+        let targets = updatable(for: m)
+        guard !targets.isEmpty else { return }
+        requestStart(targets)
+    }
+
+    private func requestStart(_ targets: [Item], logAll: Bool = false) {
+        let open = targets.filter { t in t.isApp && (t.machine.isLocal ? !LocalApps.instances(t.path).isEmpty : t.running) }
+        if !open.isEmpty && askBeforeQuitting {
+            let names = open.map { $0.machine.isLocal ? $0.name : "\($0.name) on \($0.machine.name)" }
+            pendingQuit = PendingQuit(targets: targets, openNames: names)
+            return
+        }
+        if logAll { Log.info("Update all: \(targets.map(\.key).joined(separator: ", "))") }
         enqueue(targets.map { ($0, .update) })
+    }
+
+    func confirmPendingQuit(dontAskAgain: Bool) {
+        guard let pending = pendingQuit else { return }
+        pendingQuit = nil
+        if dontAskAgain { askBeforeQuitting = false }
+        Log.info("Update confirmed (\(pending.targets.count)): \(pending.targets.map(\.key).joined(separator: ", "))")
+        enqueue(pending.targets.map { ($0, .update) })
+    }
+
+    func cancelPendingQuit() {
+        pendingQuit = nil
     }
 
     /// Saved copies this Mac app can switch to (other than the installed one), newest first.
@@ -308,11 +531,24 @@ final class AppModel: ObservableObject {
         versionLists[item.key].map { list in list.filter { !item.saved.contains($0) } }
     }
 
-    /// Looks up the published versions once per tool, the first time its menu could be opened.
+    /// Debounced version lookup on hover so gliding across rows doesn't burst npm/GitHub requests.
+    func scheduleLoadVersions(_ item: Item, hovering: Bool) {
+        hoverTasks[item.key]?.cancel()
+        hoverTasks[item.key] = nil
+        guard hovering, item.supportsRollback, versionLists[item.key] == nil, !loadingVersions.contains(item.key) else { return }
+        hoverTasks[item.key] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.loadVersions(item)
+        }
+    }
+
+    /// Looks up the published versions once per tool.
     func loadVersions(_ item: Item) {
         guard item.supportsRollback, versionLists[item.key] == nil, loadingVersions.insert(item.key).inserted else { return }
+        let catalog = Catalog.load()
         Task {
-            let list = await LatestResolver().versions(of: item, catalog: Catalog.load())
+            let list = await LatestResolver().versions(of: item, catalog: catalog)
             versionLists[item.key] = list
             loadingVersions.remove(item.key)
         }
@@ -325,6 +561,45 @@ final class AppModel: ObservableObject {
     }
 
     func dismiss(_ item: Item) { if !isActive(item) { activity[item.key] = nil } }
+
+    /// Cancels a queued or running update cleanly.
+    func cancel(_ item: Item) {
+        let key = item.key
+        switch activity[key] {
+        case .queued?:
+            if var list = pending[item.machine] {
+                list.removeAll { $0.0.key == key }
+                pending[item.machine] = list.isEmpty ? nil : list
+            }
+            activity[key] = nil
+            batchTotal = max(0, batchTotal - 1)
+            Log.info("cancelled queued \(key)")
+        case .running?:
+            guard canCancel(item) else { return }
+            runningTasks[key]?.cancel()
+            Log.info("cancelling running \(key)")
+        default:
+            break
+        }
+    }
+
+    /// Cancels all queued jobs and all cancellable running jobs.
+    func cancelAll() {
+        pendingQuit = nil
+        for (_, jobs) in pending {
+            for (item, _) in jobs {
+                activity[item.key] = nil
+                batchTotal = max(0, batchTotal - 1)
+            }
+        }
+        pending = [:]
+        for (key, task) in runningTasks {
+            if let item = items.first(where: { $0.key == key }), canCancel(item) {
+                task.cancel()
+            }
+        }
+        Log.info("cancelled remaining updates")
+    }
 
     /// What a queued job is waiting for: a check of its machine, or the job running in its lane there.
     func queuedMessage(_ item: Item) -> String {
@@ -359,7 +634,12 @@ final class AppModel: ObservableObject {
         var seen = Set<String>()
         let fresh = jobs.filter { !isActive($0.0) && seen.insert($0.0.key).inserted }
         guard !fresh.isEmpty else { return }
-        if !isBusy { batch = [] }
+        if !isBusy {
+            batch = []
+            batchTotal = 0
+            batchCompleted = 0
+        }
+        batchTotal += fresh.count
         for (item, job) in fresh {
             activity[item.key] = .queued
             pending[item.machine, default: []].append((item, job))
@@ -368,7 +648,8 @@ final class AppModel: ObservableObject {
     }
 
     /// Which jobs may run side by side on one machine. Jobs in the same lane run one at a time: one package
-    /// manager (npm, Homebrew, apt, ...) never runs twice at once, and Mac app downloads go one by one.
+    /// manager (npm, Homebrew, apt, ...) never runs twice at once. Direct Mac app downloads each get their own
+    /// lane so downloads and signature checks run in parallel (while `SwapGate` serializes only the brief swap).
     /// A tool's own updater only touches that tool, so each gets its own lane.
     nonisolated static func lane(_ item: Item) -> String {
         switch item.method {
@@ -378,10 +659,10 @@ final class AppModel: ObservableObject {
         case .pipx: "pipx"
         case .uv: "uv"
         case .selfUpdate: "self:\(item.defID)"
-        case .macDirect: "apps"
+        case .macDirect: "app:\(item.key)"
         case .winget: "winget"
         case .deb: "apt"
-        case .none: "manual"
+        case .bundledWithApp, .none: "manual"
         }
     }
 
@@ -406,9 +687,17 @@ final class AppModel: ObservableObject {
         while scanning.contains(m) { try? await Task.sleep(for: .milliseconds(200)) }
         // Each job is confirmed as soon as it ends, so one slow update never leaves the others at "checking…".
         while let i = pending[m]?.firstIndex(where: { Self.lane($0.0) == lane.name }) {
-            let (item, job) = pending[m]!.remove(at: i)
+            let (queuedItem, job) = pending[m]!.remove(at: i)
+            // Refresh from latest scanned items so we never run with stale version metadata (e.g. after apt refresh).
+            let item = items.first { $0.key == queuedItem.key } ?? queuedItem
             let outcome = await run(item, job)
+            if outcome.cancelled {
+                activity[item.key] = nil
+                batchTotal = max(0, batchTotal - 1)
+                continue
+            }
             await verify(m, [(item, job, outcome)])
+            batchCompleted += 1
         }
         if pending[m]?.isEmpty == true { pending[m] = nil }
         workers.remove(lane)
@@ -426,7 +715,7 @@ final class AppModel: ObservableObject {
         let what = if case let .install(v, source) = job { "switch to \(v) (\(source == .saved ? "saved copy" : "published"))" } else { "update \(item.summary)" }
         let file = Log.newRun(key)
         runFiles[key] = file
-        Log.appendRun(file, "\(Log.stamp()) \(item.name) on \(item.machine.name): \(what)\n")
+        let headerLine = "\(Log.stamp()) \(item.name) on \(item.machine.name): \(what)\n"
         let reporter = Reporter(runFile: file) { [weak self] text, fraction in
             Task { @MainActor in
                 guard let self, case .running = self.activity[key] else { return }
@@ -434,11 +723,22 @@ final class AppModel: ObservableObject {
                 self.lastProgress[key] = Date()
             }
         }
-        let outcome = await perform(item, job, reporter)
-        Log.appendRun(file, "\n\(Log.stamp()) \(outcome.ok ? "Done" : "FAILED"): \(outcome.message)\n")
-        activity[key] = outcome.ok ? .checking(outcome.message) : .failed(outcome.message)
+        let performFn = perform
+        let task = Task<UpdateOutcome, Never> {
+            Log.appendRun(file, headerLine)
+            let outcome = await performFn(item, job, reporter)
+            Log.appendRun(file, "\n\(Log.stamp()) \(outcome.cancelled ? "Cancelled" : outcome.ok ? "Done" : "FAILED"): \(outcome.message)\n")
+            return outcome
+        }
+        runningTasks[key] = task
+        let outcome = await task.value
+        runningTasks[key] = nil
         runStarted[key] = nil
         lastProgress[key] = nil
+        if outcome.cancelled {
+            return outcome
+        }
+        activity[key] = outcome.ok ? .checking(outcome.message) : .failed(outcome.message)
         if !outcome.ok && Engine.needsSignIn(outcome.message) {
             // Update all skips it until it's signed in; its own Update/Retry button still runs it.
             if waitingForSignIn.insert(key).inserted { Log.info("\(key): needs a sign-in, left out of Update all until it updates") }
@@ -454,11 +754,31 @@ final class AppModel: ObservableObject {
         return (now.timeIntervalSince(start), now.timeIntervalSince(lastProgress[item.key] ?? start))
     }
 
-    /// Re-reads the machine once its queue is empty and confirms each job by its installed version. Only then
-    /// is it shown as done and recorded (the version kept for rollback, a hold on Update all).
+    /// Confirms finished jobs by reading their new installed version: uses fast targeted single-item verification
+    /// in production (and falls back to `scan` when overridden in tests).
     private func verify(_ m: Machine, _ done: [(Item, Job, UpdateOutcome)]) async {
+        let catalog = Catalog.load()
+        if !customScan, done.count == 1 {
+            let (item, job, o) = done[0]
+            let (status, fresh) = await Engine.verifySingle(item, catalog: catalog, resolver: LatestResolver(),
+                                                            preferDirectDownloads: preferDirectDownloads)
+            applySingle(status, fresh)
+            let offline = if case .offline = status.state { true } else { false }
+            let key = item.key
+            let version: String? = if case let .install(v, _) = job { v } else { nil }
+            let (ok, message) = Engine.confirm(item, switchedTo: version, o, fresh: fresh, offline: offline)
+            if ok, let hold = History.record(item, switchedTo: version, o) {
+                Log.info("\(key): \(hold == .added ? "held back from Update all" : "back in Update all")")
+            }
+            if o.ok && !ok { Log.error("verify \(key): \(message)") }
+            activity[key] = ok ? .done(message) : .failed(message)
+            batch.append((item.name, ok, message))
+            previous = History.previous
+            excluded = History.excluded
+            return
+        }
         let known = Dictionary(items.filter { $0.machine == m }.compactMap { i in i.latest.map { (i.key, $0) } }, uniquingKeysWith: { a, _ in a })
-        let (status, found) = await scan(m, Catalog.load(), LatestResolver(), known)
+        let (status, found) = await scan(m, catalog, LatestResolver(), known)
         apply(status, found)
         let offline = if case .offline = status.state { true } else { false }
         for (item, job, o) in done {
@@ -477,6 +797,11 @@ final class AppModel: ObservableObject {
     }
 
     private func finishBatch() {
+        defer {
+            batchTotal = 0
+            batchCompleted = 0
+        }
+        refreshBackupStats()
         guard !batch.isEmpty else { return }
         let failed = batch.filter { !$0.ok }, ok = batch.filter(\.ok)
         Log.info("batch done: \(ok.count) ok, \(failed.count) failed"
@@ -502,24 +827,6 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: Asking
-
-    /// One prompt listing the open apps an update will quit and reopen, with "Don't ask again".
-    private func confirmQuit(_ targets: [Item]) -> Bool {
-        let open = targets.filter { t in t.isApp && (t.machine.isLocal ? !LocalApps.instances(t.path).isEmpty : t.running) }
-        guard !open.isEmpty, askBeforeQuitting else { return true }
-        let alert = NSAlert()
-        alert.messageText = open.count == 1 ? "\(open[0].name) is open" : "\(open.count) apps are open"
-        alert.informativeText = open.map { $0.machine.isLocal ? $0.name : "\($0.name) on \($0.machine.name)" }.joined(separator: ", ")
-            + (open.count == 1 ? " will quit, update and reopen." : " will each quit, update and reopen.")
-        alert.addButton(withTitle: "Update & Relaunch")
-        alert.addButton(withTitle: "Cancel")
-        alert.showsSuppressionButton = true
-        alert.suppressionButton?.title = "Don't ask again"
-        NSApp.activate(ignoringOtherApps: true)
-        let ok = alert.runModal() == .alertFirstButtonReturn
-        if ok && alert.suppressionButton?.state == .on { askBeforeQuitting = false }
-        return ok
-    }
 
     private func confirmInstall(_ item: Item, version v: String) -> Bool {
         let older = Version.isNewer(item.installed ?? "", than: v)
@@ -566,7 +873,7 @@ final class AppModel: ObservableObject {
     }
 
     private func post(_ content: UNMutableNotificationContent) {
-        guard canNotify else { return }
+        guard canNotify, notificationsEnabled else { return }
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 

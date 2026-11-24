@@ -62,19 +62,31 @@ struct Catalog: Codable {
         return Catalog(clis: [], apps: [])
     }
 
+    private static let cacheLock = NSLock()
+    private static var cachedUserMTime: Date?
+    private static var cachedCatalog: Catalog?
+
     /// Built-in catalog plus the user's own file; user entries replace built-ins with the same id.
+    /// Cached in memory and invalidated automatically whenever `~/.config/update-pls/harnesses.json` changes.
     static func load() -> Catalog {
-        var c = bundled()
-        guard let data = try? Data(contentsOf: userFile) else { return c }
-        struct Partial: Codable { var clis: [CLIDef]?; var apps: [AppDef]? }
-        let user: Partial
-        do { user = try JSONDecoder().decode(Partial.self, from: data) } catch {
-            Log.error("\(userFile.path) is not valid, so your own tools are left out: \(error)")
+        let mtime = (try? FileManager.default.attributesOfItem(atPath: userFile.path)[.modificationDate]) as? Date
+        return cacheLock.withLock {
+            if let hit = cachedCatalog, cachedUserMTime == mtime { return hit }
+            var c = bundled()
+            if let data = try? Data(contentsOf: userFile) {
+                struct Partial: Codable { var clis: [CLIDef]?; var apps: [AppDef]? }
+                do {
+                    let user = try JSONDecoder().decode(Partial.self, from: data)
+                    for d in user.clis ?? [] { c.clis.removeAll { $0.id == d.id }; c.clis.append(d) }
+                    for d in user.apps ?? [] { c.apps.removeAll { $0.id == d.id }; c.apps.append(d) }
+                } catch {
+                    Log.error("\(userFile.path) is not valid, so your own tools are left out: \(error)")
+                }
+            }
+            cachedUserMTime = mtime
+            cachedCatalog = c
             return c
         }
-        for d in user.clis ?? [] { c.clis.removeAll { $0.id == d.id }; c.clis.append(d) }
-        for d in user.apps ?? [] { c.apps.removeAll { $0.id == d.id }; c.apps.append(d) }
-        return c
     }
 
     static func writeUserTemplateIfMissing() {

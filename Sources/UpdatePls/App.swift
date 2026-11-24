@@ -21,7 +21,7 @@ struct UpdatePlsApp: App {
         MenuBarExtra {
             MenuView().environmentObject(model)
         } label: {
-            Image(nsImage: MenuIcon.image(count: model.updateCount, busy: model.isBusy))
+            Image(nsImage: MenuIcon.image(count: model.updateCount, busy: model.isBusy, hasError: model.failedCount > 0))
         }
         .menuBarExtraStyle(.window)
     }
@@ -36,7 +36,8 @@ enum SettingsWindow {
         if window == nil {
             let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView().environmentObject(model)))
             w.title = "Update pls Settings"
-            w.styleMask = [.titled, .closable]
+            w.styleMask = [.titled, .closable, .resizable]
+            w.minSize = NSSize(width: 440, height: 420)
             w.isReleasedWhenClosed = false
             w.center()
             window = w
@@ -47,15 +48,28 @@ enum SettingsWindow {
 }
 
 /// Menu bar icon: the down-arrow circle, with the update count punched into a badge when there are updates,
-/// and a dotted circle while updates are running. A template image, so it follows the menu bar's light or dark look.
+/// a dotted circle while updates are running, and an exclamation badge when a failure needs attention.
+/// Memoized by state so download progress ticks don't redraw CoreGraphics images on every percent change.
 enum MenuIcon {
-    static func image(count: Int, busy: Bool = false) -> NSImage {
-        let name = busy ? "arrow.down.circle.dotted" : count > 0 ? "arrow.down.circle.fill" : "arrow.down.circle"
+    private struct Key: Hashable { let count: Int; let busy: Bool; let hasError: Bool }
+    private static let lock = NSLock()
+    private static var cache: [Key: NSImage] = [:]
+
+    static func image(count: Int, busy: Bool = false, hasError: Bool = false) -> NSImage {
+        let key = Key(count: min(count, 100), busy: busy, hasError: hasError)
+        if let hit = lock.withLock({ cache[key] }) { return hit }
+        let img = render(count: count, busy: busy, hasError: hasError)
+        lock.withLock { cache[key] = img }
+        return img
+    }
+
+    private static func render(count: Int, busy: Bool, hasError: Bool) -> NSImage {
+        let name = busy ? "arrow.down.circle.dotted" : (count > 0 || hasError) ? "arrow.down.circle.fill" : "arrow.down.circle"
         let symbol = (NSImage(systemSymbolName: name, accessibilityDescription: busy ? "Update pls, updating" : "Update pls")
             ?? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "Update pls")!)
             .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))!
-        guard count > 0, !busy else { symbol.isTemplate = true; return symbol }
-        let label = count > 99 ? "99+" : "\(count)"
+        guard (count > 0 || hasError), !busy else { symbol.isTemplate = true; return symbol }
+        let label = hasError && count == 0 ? "!" : hasError ? "!" : (count > 99 ? "99+" : "\(count)")
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .bold)
         let text = NSAttributedString(string: label, attributes: [.font: font, .foregroundColor: NSColor.black])
         let badgeW = max(12, text.size().width + 6), badgeH: CGFloat = 12
@@ -76,7 +90,7 @@ enum MenuIcon {
             return true
         }
         img.isTemplate = true
-        img.accessibilityDescription = "Update pls, \(count) updates"
+        img.accessibilityDescription = hasError ? "Update pls, update failed" : "Update pls, \(count) updates"
         return img
     }
 }

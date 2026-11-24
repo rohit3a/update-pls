@@ -3,26 +3,56 @@ import SwiftUI
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
     @State private var listHeight: CGFloat = 0
+    @State private var filter: ListFilter = .all
+    @State private var dontAskAgain = false
+
+    enum ListFilter: Hashable { case all, updates }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if model.isBusy && model.batchTotal > 1 {
+                batchBar
+            }
+            if let pending = model.pendingQuit {
+                Divider()
+                quitBanner(pending)
+            }
             Divider()
             if model.selfUpdateAvailable || model.selfError != nil { selfUpdateRow; Divider() }
+            if model.visibleToolCount > 0 && (model.updateCount > 0 || model.failedCount > 0 || model.isBusy) {
+                filterBar
+                Divider()
+            }
             // A ScrollView has no height of its own in a menu bar window, so size it to its content.
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    ForEach(model.machines) { m in MachineSection(machine: m) }
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(model.machines) { m in
+                        MachineSection(machine: m, updatesOnly: filter == .updates)
+                    }
+                    if filter == .updates && model.updateCount == 0 && !model.isBusy && model.failedCount == 0 {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            Text("Everything is up to date").font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 16)
+                    }
                 }
                 .padding(12)
                 .background(GeometryReader { g in Color.clear.preference(key: HeightKey.self, value: g.size.height) })
             }
-            .frame(height: min(max(listHeight, 1), 560))
+            .frame(height: min(max(listHeight, 1), 580))
             .onPreferenceChange(HeightKey.self) { listHeight = $0 }
             Divider()
             footer
         }
-        .frame(width: 380)
+        .frame(width: 400)
+        .onChange(of: model.updateCount) { _, count in
+            if count == 0 && !model.isBusy && model.failedCount == 0 && filter == .updates {
+                filter = .all
+            }
+        }
     }
 
     var header: some View {
@@ -31,20 +61,87 @@ struct MenuView: View {
             Spacer()
             if model.isChecking { ProgressView().controlSize(.small) }
             Button { Task { await model.checkAll(.manual) } } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.borderless).help(model.isBusy ? "Wait for the updates to finish" : "Check now")
+                .buttonStyle(.borderless).help(model.isBusy ? "Wait for the updates to finish" : "Check now (⌘R)")
+                .keyboardShortcut("r", modifiers: .command)
                 .disabled(model.isChecking || model.isBusy)
             if model.isBusy {
-                Text(model.activeCount > 0 ? "Updating \(model.activeCount)…" : "Confirming versions…").font(.caption).foregroundStyle(.secondary)
-                    .transition(.opacity)
+                Button { model.cancelAll() } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Cancel queued and running updates")
             }
             // Pressing it again only adds what isn't already queued, so nothing is ever installed twice.
             if !model.isBusy || !model.updatable.isEmpty {
                 Button("Update all (\(model.updatable.count))") { model.updateAll() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
                     .disabled(model.updatable.isEmpty || model.selfUpdating)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: model.isBusy)
-        .padding(12)
+        .padding(.horizontal, 12).padding(.vertical, 10)
+    }
+
+    var batchBar: some View {
+        let done = min(model.batchCompleted, model.batchTotal)
+        let frac = model.batchTotal > 0 ? Double(done) / Double(model.batchTotal) : 0
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text("Updating \(done) of \(model.batchTotal)")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                if model.failedCount > 0 {
+                    Text("· \(model.failedCount) failed").font(.caption).foregroundStyle(.red)
+                }
+                Spacer()
+                Text("\(model.activeCount) active").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+            }
+            ProgressView(value: frac).progressViewStyle(.linear).controlSize(.mini)
+        }
+        .padding(.horizontal, 12).padding(.bottom, 8)
+    }
+
+    func quitBanner(_ pending: AppModel.PendingQuit) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "arrow.triangle.2.circlepath.circle.fill").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pending.openNames.count == 1 ? "\(pending.openNames[0]) is open" : "\(pending.openNames.count) apps are open")
+                        .font(.subheadline.weight(.semibold))
+                    Text(pending.openNames.joined(separator: ", ") + (pending.openNames.count == 1 ? " will quit, update and reopen." : " will each quit, update and reopen."))
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 8) {
+                Toggle("Don't ask again", isOn: $dontAskAgain)
+                    .toggleStyle(.checkbox).controlSize(.small).font(.caption)
+                Spacer()
+                Button("Cancel") {
+                    dontAskAgain = false
+                    model.cancelPendingQuit()
+                }.controlSize(.small)
+                Button("Update & Relaunch") {
+                    let remember = dontAskAgain
+                    dontAskAgain = false
+                    model.confirmPendingQuit(dontAskAgain: remember)
+                }.buttonStyle(.borderedProminent).controlSize(.small)
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.08))
+    }
+
+    var filterBar: some View {
+        HStack(spacing: 8) {
+            Picker("", selection: $filter) {
+                Text("All (\(model.visibleToolCount))").tag(ListFilter.all)
+                Text("Updates (\(model.updateCount))").tag(ListFilter.updates)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
     }
 
     var selfUpdateRow: some View {
@@ -68,15 +165,20 @@ struct MenuView: View {
     }
 
     var footer: some View {
-        HStack {
+        HStack(spacing: 10) {
             if let d = model.lastCheck {
-                Text("Checked \(d.formatted(.relative(presentation: .named)))").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 3) {
+                    Text("Checked")
+                    Text(d, style: .relative)
+                    Text("ago")
+                }
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Text("v\(SelfUpdate.current)").font(.caption).foregroundStyle(.tertiary)
             Spacer()
             Button("Log") { NSWorkspace.shared.open(Log.file) }.buttonStyle(.borderless).help(Log.file.path)
-            Button("Settings…") { SettingsWindow.show(model) }.buttonStyle(.borderless)
-            Button("Quit") { model.quit() }.buttonStyle(.borderless)
+            Button("Settings…") { SettingsWindow.show(model) }.buttonStyle(.borderless).keyboardShortcut(",", modifiers: .command)
+            Button("Quit") { model.quit() }.buttonStyle(.borderless).keyboardShortcut("q", modifiers: .command)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
@@ -90,29 +192,90 @@ private struct HeightKey: PreferenceKey {
 struct MachineSection: View {
     @EnvironmentObject var model: AppModel
     let machine: Machine
+    var updatesOnly: Bool = false
+    @State private var collapsed = false
+    @State private var showUpToDate = false
 
     var status: MachineStatus? { model.statuses.first { $0.machine == machine } }
+    var machineUpdatable: [Item] { model.updatable(for: machine) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: icon).foregroundStyle(.secondary)
-                Text(machine.isLocal ? "\(machine.name) (this Mac)" : machine.name).font(.subheadline.bold())
-                Spacer()
-                statusLabel
-            }
-            let groups = model.groups(for: machine)
-            if groups.isEmpty, case .online = status?.state {
-                Text("No coding tools found").font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(Array(groups.enumerated()), id: \.element.brand) { i, g in
-                if i > 0 { Divider().padding(.leading, 24) }
-                // A brand with a CLI and an app (Claude Code + Claude Desktop) gets a header; single tools don't.
-                if g.items.count > 1 {
-                    Text(g.brand).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.leading, 24).padding(.top, 2)
+        let parts = model.partitionedGroups(for: machine)
+        let allGroups = model.groups(for: machine)
+        let hasActionable = !parts.actionable.isEmpty
+        let upToDateCount = parts.upToDate.reduce(0) { $0 + $1.items.count }
+
+        if updatesOnly && !hasActionable && status?.state == .online {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { collapsed.toggle() }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 10)
+                            Image(systemName: icon).foregroundStyle(.secondary)
+                            Text(machine.isLocal ? "\(machine.name) (this Mac)" : machine.name).font(.subheadline.bold())
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                    statusLabel
+                    if !machineUpdatable.isEmpty {
+                        Button("Update (\(machineUpdatable.count))") { model.updateMachine(machine) }
+                            .controlSize(.mini)
+                            .buttonStyle(.bordered)
+                            .disabled(model.selfUpdating)
+                    }
                 }
-                ForEach(g.items) { ItemRow(item: $0) }
+                if !collapsed {
+                    if allGroups.isEmpty, case .online = status?.state {
+                        Text("No coding tools found").font(.caption).foregroundStyle(.secondary).padding(.leading, 16)
+                    } else if updatesOnly {
+                        brandList(parts.actionable)
+                    } else if hasActionable && upToDateCount > 0 {
+                        brandList(parts.actionable)
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.15)) { showUpToDate.toggle() }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: showUpToDate ? "chevron.down" : "chevron.right")
+                                    .font(.caption2)
+                                Text("Up to date (\(upToDateCount))")
+                                    .font(.caption)
+                                Spacer()
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.leading, 16)
+                            .padding(.top, 2)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        if showUpToDate {
+                            brandList(parts.upToDate)
+                        }
+                    } else {
+                        brandList(allGroups)
+                    }
+                }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func brandList(_ groups: [(brand: String, items: [Item])]) -> some View {
+        ForEach(Array(groups.enumerated()), id: \.element.brand) { i, g in
+            if i > 0 { Divider().padding(.leading, 26) }
+            // A brand with a CLI and an app (Claude Code + Claude Desktop) gets a header; single tools don't.
+            if g.items.count > 1 {
+                Text(g.brand).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.leading, 26).padding(.top, 2)
+            }
+            ForEach(g.items) { ItemRow(item: $0) }
         }
     }
 
@@ -145,7 +308,7 @@ struct ItemRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                icon.frame(width: 16, height: 16)
+                icon.frame(width: 20, height: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(item.name).lineLimit(1)
                     detail
@@ -160,24 +323,27 @@ struct ItemRow: View {
                 action
                 Menu { menuItems } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                    .opacity(hovering ? 1 : 0).help("More")
+                    .opacity(hovering ? 1 : 0.35).help("More")
+                    .simultaneousGesture(TapGesture().onEnded { model.loadVersions(item) })
             }
             if case let .running(_, fraction) = activity {
                 Group {
                     if let fraction { ProgressView(value: fraction) } else { ProgressView() }
                 }
-                .progressViewStyle(.linear).controlSize(.small).padding(.leading, 24)
+                .progressViewStyle(.linear).controlSize(.small).padding(.leading, 28)
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(hovering ? Color.primary.opacity(0.06) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onHover { h in
             hovering = h
-            if h { model.loadVersions(item) }
+            model.scheduleLoadVersions(item, hovering: h)
         }
         .contextMenu { menuItems }
-        .animation(.easeInOut(duration: 0.25), value: activity)
+        .animation(.easeInOut(duration: 0.2), value: activity)
     }
 
     /// The line under the name: the version, or what the update is doing right now, or how it ended.
@@ -206,7 +372,20 @@ struct ItemRow: View {
             Text(msg).font(.caption).foregroundStyle(.red).lineLimit(3).fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled).help(msg)
         case nil:
-            Text(versionText).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            HStack(spacing: 4) {
+                Text(versionText).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                if case .bundledWithApp = item.method {
+                    EmptyView()
+                } else {
+                    Text(item.method.shortLabel)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 0.5)
+                        .background(Color.primary.opacity(0.06), in: Capsule())
+                        .fixedSize()
+                }
+            }
         }
     }
 
@@ -232,6 +411,9 @@ struct ItemRow: View {
         Button(skipped ? "Include in Update all" : "Skip in Update all") { model.toggleExcluded(item) }
         Button("Hide from list") { model.hidden.insert(item.key) }
         if item.supportsRollback && !model.isActive(item) { versionMenu }
+        if let notesURL = model.releaseNotesURL(for: item) {
+            Button("Release notes…") { NSWorkspace.shared.open(notesURL) }
+        }
         Divider()
         if let runFile { Button("Show last update output") { NSWorkspace.shared.open(runFile) } }
         if let cmd = item.command { Button("Copy update command") { copy(cmd) } }
@@ -272,10 +454,10 @@ struct ItemRow: View {
         return (older ? "\(v)" : "\(v)  ↑") + note
     }
 
-    /// Apps on this Mac show their real icon; everything else a symbol.
+    /// Cached app icons (also reused across remote machines when the same app is installed on this Mac).
     @ViewBuilder var icon: some View {
-        if item.isApp && item.machine.isLocal {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: item.path)).resizable()
+        if let img = AppIconCache.icon(for: item) {
+            Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
         } else {
             Image(systemName: item.isApp ? "macwindow" : "terminal").foregroundStyle(.secondary)
         }
@@ -283,6 +465,9 @@ struct ItemRow: View {
 
     var versionText: String {
         let installed = item.installed ?? "?"
+        if case let .bundledWithApp(_, appName) = item.method {
+            return "\(installed) · bundled in \(appName)"
+        }
         guard let latest = item.latest?.version else { return "\(installed) · latest unknown" }
         guard item.state == .available else { return "\(installed) · latest" }
         let text = "\(installed) → \(Self.changedPart(of: latest, from: installed))"
@@ -292,12 +477,22 @@ struct ItemRow: View {
     @ViewBuilder var action: some View {
         switch activity {
         case .queued?:
-            Image(systemName: "clock").foregroundStyle(.secondary).help("Queued")
+            HStack(spacing: 4) {
+                Image(systemName: "clock").foregroundStyle(.secondary).help("Queued")
+                Button { model.cancel(item) } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary).help("Remove from queue")
+            }
         case let .running(_, fraction)?:
-            if let fraction {
-                Text("\(Int(fraction * 100))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            } else {
-                ProgressView().controlSize(.small)
+            HStack(spacing: 4) {
+                if let fraction {
+                    Text("\(Int(fraction * 100))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                if model.canCancel(item) {
+                    Button { model.cancel(item) } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Cancel update")
+                }
             }
         case .checking?:
             ProgressView().controlSize(.small).help("Checking the new version")
@@ -321,8 +516,11 @@ struct ItemRow: View {
         case .upToDate:
             Image(systemName: "checkmark").foregroundStyle(.secondary).help("Up to date")
         case .available, .unknown:
-            if item.needsSudo, let cmd = item.command {
-                Button("Copy sudo command") { copy(cmd) }.help(cmd)
+            if case let .bundledWithApp(_, appName) = item.method {
+                Text("With app").font(.caption).foregroundStyle(.secondary)
+                    .help("This CLI runs from \(appName).app — update \(appName) to update it.")
+            } else if item.needsSudo, let cmd = item.command {
+                Button("Copy sudo command") { copy(cmd) }.controlSize(.small).help(cmd)
             } else if item.state == .available && item.canUpdate {
                 Button(item.running ? "Update & Relaunch" : "Update") { model.update(item) }
                     .buttonStyle(.borderedProminent).controlSize(.small).disabled(model.selfUpdating)
@@ -359,6 +557,28 @@ struct SettingsView: View {
                     }
                 }
             }
+            if !model.excluded.isEmpty {
+                Section("Skipped from Update all") {
+                    ForEach(model.excluded.sorted(), id: \.self) { key in
+                        HStack {
+                            Text(model.label(forKey: key))
+                            Spacer()
+                            Button("Include") { model.toggleExcluded(key: key) }
+                        }
+                    }
+                }
+            }
+            if !model.waitingForSignIn.isEmpty {
+                Section("Waiting for sign-in") {
+                    ForEach(model.waitingForSignIn.sorted(), id: \.self) { key in
+                        HStack {
+                            Text(model.label(forKey: key))
+                            Spacer()
+                            Button("Clear") { model.waitingForSignIn.remove(key) }
+                        }
+                    }
+                }
+            }
             if !model.hidden.isEmpty {
                 Section("Hidden tools") {
                     ForEach(model.hidden.sorted(), id: \.self) { key in
@@ -370,16 +590,34 @@ struct SettingsView: View {
                     }
                 }
             }
-            Section("General") {
+            Section("Updates & Apps") {
                 Picker("Check every", selection: $model.intervalHours) {
                     ForEach([1.0, 3, 6, 12, 24], id: \.self) { Text("\(Int($0)) h").tag($0) }
                 }
                 Toggle("Open at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
+                Toggle("Show notifications", isOn: $model.notificationsEnabled)
                 Toggle("Ask before quitting open apps", isOn: $model.askBeforeQuitting)
-                Picker("Versions kept for rollback", selection: $keepVersions) {
+                Toggle("Prefer direct downloads over Homebrew Cask", isOn: $model.preferDirectDownloads)
+                    .help("Updates Mac apps directly with APFS rollback backups, signature verification and pending-update reuse instead of brew upgrade --cask")
+            }
+            Section("Rollback Backups") {
+                Picker("Versions kept per app", selection: $keepVersions) {
                     ForEach([1, 2, 3, 5], id: \.self) { Text("\($0)").tag($0) }
                 }
                 .help("How many replaced versions of each app stay on disk so you can switch back without a download")
+                HStack {
+                    Text("Storage used")
+                    Spacer()
+                    Text(model.backupSummary).foregroundStyle(.secondary).font(.caption)
+                }
+                HStack {
+                    Button("Keep latest 1 per app") { model.cleanBackups(keep: 1) }
+                        .disabled(model.isCleaningBackups || model.backupVersions <= model.backupApps)
+                    Button("Clear all backups") { model.cleanBackups(keep: 0) }
+                        .disabled(model.isCleaningBackups || model.backupVersions == 0)
+                }
+            }
+            Section("Advanced") {
                 Button("Add your own tools…") {
                     Catalog.writeUserTemplateIfMissing()
                     NSWorkspace.shared.open(Catalog.userFile)
@@ -388,6 +626,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 420)
+        .frame(minWidth: 440, minHeight: 460)
+        .onAppear { model.refreshBackupStats() }
     }
 }
