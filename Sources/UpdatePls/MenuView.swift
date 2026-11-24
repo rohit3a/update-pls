@@ -3,6 +3,7 @@ import SwiftUI
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
     @State private var listHeight: CGFloat = 0
+    @State private var panelHeight: CGFloat = 0
     @State private var filter: ListFilter = .all
     @State private var dontAskAgain = false
 
@@ -48,9 +49,16 @@ struct MenuView: View {
             footer
         }
         .frame(width: 400)
+        .background(GeometryReader { g in Color.clear.preference(key: PanelHeightKey.self, value: g.size.height) })
+        .onPreferenceChange(PanelHeightKey.self) { panelHeight = $0 }
+        // The menu bar window keeps the height it first had and centres the panel in it, so a shorter panel
+        // floated mid-screen with see-through gaps above and below. Keep the panel at the top, and the window
+        // sized to the panel with its top edge under the menu bar.
+        .frame(maxHeight: .infinity, alignment: .top)
         // The menu bar window is see-through glass. In Light mode over dark windows it turns mid-gray while the
         // text stays dark, which is hard to read; a solid window background reads the same over anything.
         .background(Color(nsColor: .windowBackgroundColor))
+        .background(WindowFitter(height: panelHeight))
         .onChange(of: model.updateCount) { _, count in
             if count == 0 && !model.isBusy && model.failedCount == 0 && filter == .updates {
                 filter = .all
@@ -190,6 +198,28 @@ struct MenuView: View {
 private struct HeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+private struct PanelHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+/// Sizes the menu bar window to the panel, keeping its top edge where it is (under the menu bar).
+private struct WindowFitter: NSViewRepresentable {
+    let height: CGFloat
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        let h = height.rounded(.up)
+        guard h > 40 else { return }
+        DispatchQueue.main.async {
+            guard let w = view.window, abs(w.frame.height - h) > 0.5 else { return }
+            var f = w.frame
+            f.origin.y = f.maxY - h
+            f.size.height = h
+            w.setFrame(f, display: true)
+        }
+    }
 }
 
 struct MachineSection: View {
