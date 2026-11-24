@@ -219,23 +219,22 @@ final class AppModel: ObservableObject {
 
     var isBusy: Bool { !workers.isEmpty || activity.values.contains(where: \.isActive) }
     var activeCount: Int { activity.values.filter(\.isActive).count }
+    /// Failures shown in the list (a tool that is gone has no row to retry or dismiss, so no badge either).
     var failedCount: Int {
-        activity.values.filter { if case .failed = $0 { true } else { false } }.count
+        let shown = Set(items.map(\.key))
+        return activity.filter { key, a in if case .failed = a { shown.contains(key) } else { false } }.count
     }
     func isActive(_ item: Item) -> Bool { activity[item.key]?.isActive ?? false }
 
-    /// True if this item is queued, or running and not yet past its point of no return: the job itself says
-    /// when it starts quitting or replacing an app (see `Reporter.commit`). Over SSH, only a Mac app download
-    /// can be stopped, since a cancel can't reach an installer running there.
+    /// True if this item is queued, or running on this Mac and not yet past its point of no return: the job
+    /// itself says when it starts quitting or replacing an app (see `Reporter.commit`). Over SSH a cancel only
+    /// stops the connection, not what runs on the other machine, so a job running there always finishes.
     func canCancel(_ item: Item) -> Bool {
         switch activity[item.key] {
         case .queued?: return true
         case .running?:
-            guard let r = reporters[item.key], !r.isCommitted else { return false }
-            let current = items.first { $0.key == item.key } ?? item
-            if current.machine.isLocal { return true }
-            if case .macDirect = current.method { return true }
-            return false
+            guard item.machine.isLocal, let r = reporters[item.key], !r.isCommitted else { return false }
+            return true
         default: return false
         }
     }
@@ -728,7 +727,9 @@ final class AppModel: ObservableObject {
             let (queuedItem, job) = pending[m]!.remove(at: i)
             // Run what the latest check says, never what it said when the job was queued (e.g. after apt refresh).
             guard let item = items.first(where: { $0.key == queuedItem.key }) else {
-                activity[queuedItem.key] = .failed("\(queuedItem.name) isn't there anymore")
+                // It has no row anymore: report it with the batch rather than as a badge nothing can clear.
+                activity[queuedItem.key] = nil
+                batch.append((queuedItem.name, false, "It isn't there anymore"))
                 batchCompleted += 1
                 continue
             }
@@ -818,7 +819,7 @@ final class AppModel: ObservableObject {
             let (item, job, o) = done[0]
             var (status, fresh) = await Engine.verifySingle(item, catalog: catalog, resolver: LatestResolver(),
                                                             preferDirectDownloads: preferDirectDownloads)
-            if fresh == nil, case .online = status.state {
+            if (fresh?.installed ?? "").isEmpty, case .online = status.state {
                 // The quick read didn't find it (a new PATH, a moved command): read the whole machine afresh.
                 let known = Dictionary(items.filter { $0.machine == m }.compactMap { i in i.latest.map { (i.key, $0) } }, uniquingKeysWith: { a, _ in a })
                 let (st, all) = await Engine.check(m, catalog: catalog, resolver: LatestResolver(), known: known,

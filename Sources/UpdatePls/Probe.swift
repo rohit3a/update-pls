@@ -140,16 +140,33 @@ enum Probe {
 
     """#
 
-    /// `up_bundled FILE`: the .app a CLI wrapper script runs, if it is one (T3 Code's `t3` runs
-    /// "/Applications/T3 Code (Nightly).app/Contents/MacOS/..."). Only a script that `exec`s something counts, only
-    /// paths outside comments, quoted either way or not at all, and only an app that is really there.
+    /// `up_bundled FILE`: the .app a CLI wrapper script runs, if it is one (T3 Code's `t3` sets
+    /// app='/Applications/T3 Code (Nightly).app/Contents/MacOS/...' and runs `exec "$app" ...`). Only what the
+    /// script's `exec` really runs counts: its first word, quoted either way or not at all, or the value given to
+    /// the variable it names. Anything else in the script (comments, text) is ignored, and the app must be there.
     static let bundledFunction = #"""
+    up_word() {
+      case "$1" in
+        \"*) up_w=${1#\"}; printf '%s' "${up_w%%\"*}" ;;
+        \'*) up_w=${1#\'}; printf '%s' "${up_w%%\'*}" ;;
+        *) printf '%s' "${1%%[[:space:]]*}" ;;
+      esac
+    }
     up_bundled() {
       [ -f "$1" ] && [ "$(head -c 2 "$1" 2>/dev/null)" = "#!" ] || return 0
-      grep -qE '^[[:space:]]*exec[[:space:]]' "$1" 2>/dev/null || return 0
-      up_bp="\"/[^\"]*\\.app/Contents/MacOS/|'/[^']*\\.app/Contents/MacOS/|/[^[:space:]'\"]*\\.app/Contents/MacOS/"
-      grep -vE '^[[:space:]]*#' "$1" 2>/dev/null | grep -oE "$up_bp" 2>/dev/null | sed -E "s|^[\"']||; s|/Contents/MacOS/\$||" |
-        while IFS= read -r up_c; do if [ -d "$up_c" ]; then printf '%s' "$up_c"; break; fi; done
+      up_e=$(grep -E '^[[:space:]]*exec[[:space:]]' "$1" 2>/dev/null | head -1 | sed -E 's/^[[:space:]]*exec[[:space:]]+(-a[[:space:]]+[^[:space:]]+[[:space:]]+)?//')
+      [ -n "$up_e" ] || return 0
+      up_t=$(up_word "$up_e")
+      case "$up_t" in
+        \$\{*\}|\$[A-Za-z_]*)
+          up_v=${up_t#\$}; up_v=${up_v#\{}; up_v=${up_v%\}}
+          case "$up_v" in *[!A-Za-z0-9_]*) return 0 ;; esac
+          up_l=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$up_v=" "$1" 2>/dev/null | tail -1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?$up_v=//")
+          up_t=$(up_word "$up_l") ;;
+      esac
+      case "$up_t" in /*.app/Contents/MacOS/*) ;; *) return 0 ;; esac
+      up_a="${up_t%%.app/Contents/MacOS/*}.app"
+      if [ -d "$up_a" ]; then printf '%s' "$up_a"; fi
     }
 
     """#

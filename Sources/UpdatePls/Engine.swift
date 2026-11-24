@@ -279,7 +279,8 @@ enum Engine {
         let probe = Probe.parse(out.stdout)
         // The script says what system it really ran on; trust that over what was remembered.
         setCachedOS(os == .windows ? os : probe.os, for: m)
-        if !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
+        // Only a PATH read from the login shell renews the cache (a cached one is just echoed back).
+        if pathHint == nil, !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
         for line in probe.recovery { Log.error("check \(m.id): interrupted update: \(line)") }
         if probe.wingetUnreadable { Log.error("check \(m.id): couldn't read winget's list (it may not be in English), so its apps aren't shown") }
         var items = buildItems(probe, machine: m, catalog: catalog, preferDirectDownloads: preferDirectDownloads)
@@ -307,14 +308,15 @@ enum Engine {
             return (st, all.first { $0.key == item.key })
         }
         let start = Date(), asleep = SleepClock.asleep
-        let script = Probe.verifyScript(for: item, catalog: catalog, cachedPath: cachedPath(for: m))
+        let pathHint = cachedPath(for: m)
+        let script = Probe.verifyScript(for: item, catalog: catalog, cachedPath: pathHint)
         let out = await Runner.run(m, os: item.os, script: script, timeout: 60)
         if out.status == 255 || (out.timedOut && out.stdout.isEmpty) {
             let msg = out.timedOut ? "Timed out" : out.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return (MachineStatus(machine: m, os: item.os, state: .offline(msg)), nil)
         }
         let probe = Probe.parse(out.stdout)
-        if !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
+        if pathHint == nil, !probe.resolvedPath.isEmpty { setCachedPath(probe.resolvedPath, for: m) }
         let built = buildItems(probe, machine: m, catalog: catalog, preferDirectDownloads: preferDirectDownloads)
         // Only this tool counts: never another one the script happened to report.
         guard var fresh = built.first(where: { $0.key == item.key })
@@ -511,6 +513,19 @@ enum Engine {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType) == .typeDirectory
     }
 
+    /// The saved versions folder, only if every folder from `home` down to it is a real folder (none a symlink).
+    static func backupsRoot(home: URL) -> URL? {
+        var url = home
+        for part in backupsDir.split(separator: "/") {
+            url.appendPathComponent(String(part))
+            guard isRealDirectory(url) else { return nil }
+        }
+        return url
+    }
+
+    /// Removes a folder only if it is empty (hidden files included): never recursive.
+    private static func removeIfEmpty(_ url: URL) { _ = rmdir(url.path) }
+
     private static func children(_ url: URL) -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.contentModificationDateKey],
                                                        options: .skipsHiddenFiles)) ?? [])
@@ -520,8 +535,7 @@ enum Engine {
     /// sitting at Backups/<tool>/<App>.app. Symlinks are skipped at every level.
     static func savedCopies(home: URL = FileManager.default.homeDirectoryForCurrentUser)
         -> [(tool: URL, folder: URL?, app: URL, date: Date)] {
-        let root = home.appendingPathComponent(backupsDir)
-        guard isRealDirectory(root) else { return [] }
+        guard let root = backupsRoot(home: home) else { return [] }
         func date(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast }
         var out: [(URL, URL?, URL, Date)] = []
         for tool in children(root) where isRealDirectory(tool) {
@@ -560,10 +574,14 @@ enum Engine {
     /// one app (T3 Code and T3 Code Nightly) share a folder but are counted apart, so one never costs the other its
     /// copies. Refused while an update is filing or relying on a saved version on this Mac.
     static func pruneBackups(keep: Int, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> Result<Int, PruneRefusal> {
-        let markers = home.appendingPathComponent(swapMarkersDir)
-        if !children(markers).isEmpty { return .failure(.updating) }
+        // The lock first, then the markers: a swap can't start (or end half done) between the two.
         guard case let .success(lock) = ItemLock.take(ItemLock.backupsKey) else { return .failure(.updating) }
         defer { lock.release() }
+        let markers = home.appendingPathComponent(swapMarkersDir)
+        if FileManager.default.fileExists(atPath: markers.path) {
+            // Can't tell whether a swap is waiting to be finished: touch nothing.
+            guard let list = try? FileManager.default.contentsOfDirectory(atPath: markers.path), list.isEmpty else { return .failure(.updating) }
+        }
         let fm = FileManager.default
         let lsreg = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
         var removed = 0
@@ -576,12 +594,15 @@ enum Engine {
                 p.standardOutput = FileHandle.nullDevice
                 p.standardError = FileHandle.nullDevice
                 if (try? p.run()) != nil { p.waitUntilExit() }
+                // Checked again just before: still a real folder, not swapped for a link meanwhile.
+                guard isRealDirectory(old.app), old.folder.map(isRealDirectory) ?? true else { continue }
                 if (try? fm.removeItem(at: old.app)) != nil { removed += 1 }
-                if let folder = old.folder, children(folder).isEmpty { try? fm.removeItem(at: folder) }
+                if let folder = old.folder { removeIfEmpty(folder) }
             }
         }
-        let root = home.appendingPathComponent(backupsDir)
-        for tool in children(root) where isRealDirectory(tool) && children(tool).isEmpty { try? fm.removeItem(at: tool) }
+        if let root = backupsRoot(home: home) {
+            for tool in children(root) where isRealDirectory(tool) { removeIfEmpty(tool) }
+        }
         return .success(removed)
     }
 

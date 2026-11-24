@@ -20,13 +20,15 @@ struct ShellResult {
 enum Shell {
     private final class CancelState: @unchecked Sendable {
         let lock = NSLock()
-        var pid: pid_t?
+        /// The process and when it started, which together say it is still the same process.
+        var pid: (pid_t, UInt64)?
         var cancelled = false
 
         func attach(_ pid: pid_t) -> Bool {
+            let started = Shell.startTime(pid)
             lock.lock()
             let wasCancelled = cancelled
-            self.pid = pid
+            if let started { self.pid = (pid, started) }
             lock.unlock()
             return wasCancelled
         }
@@ -39,7 +41,7 @@ enum Shell {
             cancelled = true
             let pid = self.pid
             lock.unlock()
-            if let pid { Shell.killTree(pid) }
+            if let pid { Shell.killTree(pid.0, started: pid.1) }
         }
 
         var isCancelled: Bool { lock.withLock { cancelled } }
@@ -103,8 +105,9 @@ enum Shell {
             err.fileHandleForReading.readabilityHandler = nil
             return ShellResult(status: -1, stdout: "", stderr: "Couldn't start \(launchPath): \(error.localizedDescription)")
         }
+        let rootStarted = startTime(p.processIdentifier)
         if cancelState.attach(p.processIdentifier) {
-            killTree(p.processIdentifier)
+            killTree(p.processIdentifier, started: rootStarted)
         }
         if let input { try? inp.fileHandleForWriting.write(contentsOf: Data(input.utf8)) }
         try? inp.fileHandleForWriting.close()
@@ -113,7 +116,7 @@ enum Shell {
         let timer = DispatchWorkItem {
             guard p.isRunning else { return }
             lock.lock(); timedOut = true; lock.unlock()
-            killTree(p.processIdentifier)
+            killTree(p.processIdentifier, started: rootStarted)
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
         p.waitUntilExit()
@@ -133,9 +136,14 @@ enum Shell {
 
     /// Stops a process and all its descendants: TERM first, KILL after 3 seconds. Each process is known by its
     /// PID and start time, so a PID that was freed and handed to another process in between is left alone.
-    static func killTree(_ root: pid_t) {
+    /// `started` is when `root` started, taken when it was launched: if that PID now belongs to another process,
+    /// nothing is signalled.
+    static func killTree(_ root: pid_t, started: UInt64? = nil) {
+        if let started, startTime(root) != started { return }
         let procs = ([root] + descendants(of: root)).compactMap { pid in startTime(pid).map { (pid, $0) } }
-        for (pid, _) in procs.reversed() { kill(pid, SIGTERM) }
+        // A child can't have started before its parent: anything that did took over a freed PID.
+        let rootStart = procs.first?.1 ?? 0
+        for (pid, t) in procs.reversed() where t >= rootStart && startTime(pid) == t { kill(pid, SIGTERM) }
         DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
             for (pid, started) in procs where startTime(pid) == started { kill(pid, SIGKILL) }
         }

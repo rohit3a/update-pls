@@ -345,7 +345,8 @@ extension Engine {
         var outcome: UpdateOutcome
         switch item.method {
         case .macDirect:
-            if !dryRun, let info = item.latest, let copy = item.saved.first(where: { Version.clean($0) == Version.clean(info.version) }) {
+            let saved = item.machine.isLocal ? Engine.savedVersions(of: item) : item.saved
+            if !dryRun, let info = item.latest, let copy = saved.first(where: { Version.clean($0) == Version.clean(info.version) }) {
                 // Back to the latest after a rollback: that version is saved here already (its signature is checked again).
                 outcome = await installMacApp(item, version: copy, from: .saved, exact: false, relaunch: relaunch, r)
             } else if let info = item.latest, info.url != nil {
@@ -431,7 +432,7 @@ extension Engine {
         if offline { return (true, o.message + " (machine went offline before it could be re-checked)") }
         guard let fresh, let now = fresh.installed, !now.isEmpty else {
             // Nothing to compare with before either, or nothing was meant to change: the job's own result stands.
-            if !o.changed || (item.installed ?? "").isEmpty { return (true, o.message) }
+            if !o.changed || (version == nil && (item.installed ?? "").isEmpty) { return (true, o.message) }
             // It said it worked, but the tool can't be found or read any more (a removed command, a broken install).
             return (false, "\(o.message == "Updated" ? "It updated" : o.message), but \(item.name)'s version can't be read now. Check it, then press Retry.")
         }
@@ -468,6 +469,7 @@ extension Engine {
         let res = await Runner.run(item.machine, os: item.os, script: commandScript(item, brewRefresh(item) + cmd, relaunch: relaunch,
                                                                                     cachedPath: Engine.cachedPath(for: item.machine)),
                                    timeout: 900, onOutput: r.sink)
+        if res.stdout.contains("BREW_REFRESHED\t") { noteBrewRefreshed(item) }
         guard res.ok else {
             if res.cancelled { return .cancelledOutcome(output: res.combined) }
             var o = UpdateOutcome.fail(failure(res), output: res.combined)
@@ -490,11 +492,20 @@ extension Engine {
         default: return ""
         }
         let due = brewLock.withLock {
-            if let last = brewRefreshed[item.machine.id], now.timeIntervalSince(last) < 600 { return false }
-            brewRefreshed[item.machine.id] = now
-            return true
+            guard let last = brewRefreshed[item.machine.id] else { return true }
+            return now.timeIntervalSince(last) >= 600
         }
-        return due ? "echo '==> Refreshing Homebrew'\nbrew update --quiet >/dev/null 2>&1 || true\n" : ""
+        guard due else { return "" }
+        return """
+            echo '==> Refreshing Homebrew'
+            if brew update --quiet >/dev/null 2>&1; then echo "BREW_REFRESHED\t1"; else echo "Couldn't refresh Homebrew's package list; using the one it has" >&2; fi
+
+            """
+    }
+
+    /// Records a Homebrew refresh that worked (seen in its output), so the next 10 minutes skip it.
+    static func noteBrewRefreshed(_ item: Item, now: Date = Date()) {
+        brewLock.withLock { brewRefreshed[item.machine.id] = now }
     }
 
     static func commandScript(_ item: Item, _ cmd: String, relaunch: Bool, cachedPath: String? = nil) -> String {
@@ -615,14 +626,40 @@ extension Engine {
         """
     }
 
-    /// Puts an app back if its swap was cut off: between moving it aside and moving the new version in (the app
-    /// is gone), or while copying it to another volume (the app is there but incomplete, so its signature fails).
-    /// The marker stays until the app is back, so a failed attempt is tried again. Only run while holding that
-    /// tool's `ItemLock`, or on a marker old enough that no swap can still be running.
-    static let macRecoverBody = """
+    /// `up_file_old K F`: files the previous version K (moved aside next to the app, on the app's volume) as F among
+    /// the saved versions (on another volume). It is copied into a temporary folder beside F, checked, and renamed
+    /// into place, so F is never a partial copy; K is removed only then.
+    static let fileOldFunction = """
+        up_file_old() {
+          up_k=$1; up_f=$2; up_t="$2.update-pls-tmp"
+          mkdir -p "$(dirname "$up_f")" || return 1
+          rm -rf "$up_t"
+          if ! ditto "$up_k" "$up_t"; then rm -rf "$up_t"; return 1; fi
+          if [ "$(defaults read "$up_t/Contents/Info" CFBundleShortVersionString 2>/dev/null)" != "$(defaults read "$up_k/Contents/Info" CFBundleShortVersionString 2>/dev/null)" ]; then rm -rf "$up_t"; return 1; fi
+          if codesign --verify --strict "$up_k" >/dev/null 2>&1 && ! codesign --verify --deep --strict "$up_t" >/dev/null 2>&1; then rm -rf "$up_t"; return 1; fi
+          rm -rf "$up_f"
+          if ! mv "$up_t" "$up_f"; then rm -rf "$up_t"; return 1; fi
+          rm -rf "$up_k"
+          return 0
+        }
+
+        """
+
+    /// Finishes a swap that was cut off. The marker lists the app, where its previous version was moved, the tool,
+    /// and (once the new version is in) where that previous version is still to be filed.
+    /// - Cut off between the two moves (the app is gone), or while the app was incomplete: the previous version is
+    ///   put back.
+    /// - Cut off while filing the previous version under the saved versions: the filing is done again.
+    /// The marker stays until that worked, so a failed attempt is tried again. Only run while holding that tool's
+    /// `ItemLock` and the backups lock.
+    static let macRecoverBody = fileOldFunction + """
         if [ -f "$MARK" ]; then
-          A=$(sed -n 1p "$MARK"); K=$(sed -n 2p "$MARK"); back=1
-          if [ -n "$A" ] && [ -d "$K" ]; then
+          A=$(sed -n 1p "$MARK"); K=$(sed -n 2p "$MARK"); F=$(sed -n 4p "$MARK"); back=1
+          if [ -n "$F" ]; then
+            if [ -d "$K" ] && [ ! -L "$K" ]; then
+              if up_file_old "$K" "$F"; then echo "FILED	$F"; else back=0; echo "FILE_FAILED	$K"; fi
+            fi
+          elif [ -n "$A" ] && [ -d "$K" ]; then
             if [ ! -e "$A" ] || { ! codesign --verify --strict "$A" >/dev/null 2>&1 && codesign --verify --strict "$K" >/dev/null 2>&1; }; then
               if mkdir -p "$(dirname "$A")" && rm -rf "$A" && mv "$K" "$A"; then echo "RECOVERED	$A"; else back=0; echo "RECOVER_FAILED	$A"; fi
             fi
@@ -654,11 +691,15 @@ extension Engine {
         for m in markers {
             let lines = ((try? String(contentsOf: dir.appendingPathComponent(m), encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
             guard lines.count >= 3, case let .success(lock) = ItemLock.take(lines[2]) else { continue }
+            guard case let .success(backups) = await ItemLock.take(ItemLock.backupsKey, waitingUpTo: 30) else { lock.release(); continue }
             let res = await run(macRecoverScript(marker: "\(swapMarkersDir)/\(m)"), 120, nil)
+            backups.release()
             lock.release()
             let f = fields(res)
             if let a = f["RECOVERED"] { Log.error("put \(a) back after an interrupted update"); restored.append(a) }
             if let a = f["RECOVER_FAILED"] { Log.error("\(a) is missing after an interrupted update, and its previous version couldn't be put back") }
+            if let a = f["FILED"] { Log.info("saved \(a) for rollback, left over from an interrupted update") }
+            if let a = f["FILE_FAILED"] { Log.error("the previous version at \(a) still couldn't be saved for rollback") }
         }
         return restored
     }
@@ -800,7 +841,10 @@ extension Engine {
           fi
           sleep 0.5
         done
-        if [ $idle -lt 8 ]; then up_fail \(Shell.q("\(name) is still installing its own update. Let it finish, then press Retry.")); fi
+        if [ $idle -lt 8 ]; then
+          echo "UPDATER_BUSY	1"
+          up_fail \(Shell.q("\(name) is still installing its own update. Let it finish, then press Retry."))
+        fi
         report
 
         """
@@ -808,9 +852,11 @@ extension Engine {
 
     /// Swaps another version in: a checked download (`staged`) or a saved copy of `version`.
     /// The version it replaces is saved for rollback, and only the newest `keep` saved versions are kept.
+    /// `expect` is the installed version the update was checked against: the swap refuses if it is anything else
+    /// right before the app is moved. `forward` (an update, not a switch) also refuses an unreadable version.
     static func macSwapScript(app: String, bundleID: String, name: String, staged: String?, version: String,
                               stage: String, saved: String, keep: Int, marker: String? = nil, key: String = "", trust: Bool = true,
-                              expect: String? = nil) -> String {
+                              expect: String? = nil, forward: Bool = false) -> String {
         let appName = (app as NSString).lastPathComponent
         let source = staged.map { """
             NEW=\(Shell.q($0))
@@ -818,140 +864,181 @@ extension Engine {
             """ } ?? """
             NEW=""
             for c in "$SV"/*/"$AN" "$SV/$AN"; do
-              if [ -d "$c" ] && [ "$(defaults read "$c/Contents/Info" CFBundleShortVersionString 2>/dev/null)" = "$WANT" ]; then NEW="$c"; break; fi
+              if [ -d "$c" ] && [ ! -L "$c" ] && [ "$(defaults read "$c/Contents/Info" CFBundleShortVersionString 2>/dev/null)" = "$WANT" ]; then NEW="$c"; break; fi
             done
             [ -n "$NEW" ] || up_fail "No saved copy of \(name) $WANT on this machine"
             [ "$(defaults read "$NEW/Contents/Info" CFBundleIdentifier)" = "$BID" ] || up_fail "The saved copy is a different app"
             \(trust ? #"codesign --verify --deep --strict "$NEW" || up_fail "The saved copy's signature is broken""# : "")
             """
-        return macHeader(app: app, bundleID: bundleID) + """
+        return macHeader(app: app, bundleID: bundleID) + fileOldFunction + keepPreFunction + """
         SV="$HOME/"\(Shell.q(saved)); ST="$HOME/"\(Shell.q(stage)); AN=\(Shell.q(appName)); WANT=\(Shell.q(version))
         up_step \(Shell.q("Installing \(name) \(version)"))
         \(source)
-        if app_running; then up_fail \(Shell.q("\(name) is open again; quit it and press Retry")); fi
-        # The installed version is read again right here: if it changed since it was checked (the app's own
-        # updater got there first), whatever is swapped in could be older than what is now installed.
-        EXPECT=\(Shell.q(expect ?? ""))
-        if [ -n "$EXPECT" ] && [ "$(current)" != "$EXPECT" ]; then
-          up_fail "\(name) changed to $(current) while it was being updated (expected $EXPECT); press Retry"
-        fi
-        up_stop_shipit
-        mkdir -p "$SV"
-        # Copies saved by Update pls 0.3 sit directly in the folder; file them under their version.
-        if [ -d "$SV/$AN" ] && [ "$NEW" != "$SV/$AN" ]; then
-          old=$(defaults read "$SV/$AN/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo unknown)
-          rm -rf "$SV/$old/$AN"; mkdir -p "$SV/$old"; mv "$SV/$AN" "$SV/$old/$AN"
-        fi
-        CUR=$(current)
-        KEEP="$SV/${CUR:-unknown}"
-        rm -rf "$KEEP/$AN"; mkdir -p "$KEEP"
         DEST=$(dirname "$APP")
         dev() { stat -f %d "$1" 2>/dev/null; }
         # Both moves below must be renames on the app's own volume, which are instant and can't be half done.
         # Across volumes `mv` copies, and a cut-off copy would leave half an app in place: so a download on
-        # another volume is first copied next to the app and checked there, and the old version is moved aside
-        # next to it, then copied to the saved versions once the new one is in place.
+        # another volume is first copied next to the app and checked there.
+        TMPNEW=""
+        trap 'if [ -n "$TMPNEW" ]; then rm -rf "$TMPNEW"; fi' EXIT
         if [ "$(dev "$NEW")" != "$(dev "$DEST")" ]; then
           up_step \(Shell.q("Copying \(name) \(version) next to the installed app"))
           TMPNEW="$DEST/.$AN.update-pls-new"
           rm -rf "$TMPNEW"
-          if ! ditto "$NEW" "$TMPNEW"; then rm -rf "$TMPNEW"; up_fail "Couldn't copy \(name) $WANT to $DEST"; fi
-          \(trust ? #"if ! codesign --verify --deep --strict "$TMPNEW"; then rm -rf "$TMPNEW"; up_fail "The copy next to the app has a broken signature"; fi"# : "")
-          [ "$(defaults read "$TMPNEW/Contents/Info" CFBundleIdentifier 2>/dev/null)" = "$BID" ] || { rm -rf "$TMPNEW"; up_fail "The copy next to the app is a different app"; }
+          ditto "$NEW" "$TMPNEW" || up_fail "Couldn't copy \(name) $WANT to $DEST"
+          \(trust ? #"codesign --verify --deep --strict "$TMPNEW" || up_fail "The copy next to the app has a broken signature""# : "")
+          [ "$(defaults read "$TMPNEW/Contents/Info" CFBundleIdentifier 2>/dev/null)" = "$BID" ] || up_fail "The copy next to the app is a different app"
           NEW="$TMPNEW"
           up_step \(Shell.q("Installing \(name) \(version)"))
         fi
-        if [ "$(dev "$KEEP")" = "$(dev "$DEST")" ]; then OLD="$KEEP/$AN"; else OLD="$DEST/.$AN.update-pls-old"; rm -rf "$OLD"; fi
-        echo "BACKUP	$CUR"
-        # If this is cut off between the two moves, the next run puts the app back (see macRecoverSnippet).
+        # Read again right before anything is moved: if the app's own updater changed it since it was checked,
+        # what is swapped in could be older than what is installed now.
+        if app_running; then up_fail \(Shell.q("\(name) is open again; quit it and press Retry")); fi
+        CUR=$(current)
+        EXPECT=\(Shell.q(expect ?? ""))
+        if [ -n "$EXPECT" ] && [ "$CUR" != "$EXPECT" ]; then
+          up_fail "\(name) changed to ${CUR:-an unreadable version} while it was being updated (expected $EXPECT); press Retry"
+        fi
+        if [ \(forward ? 1 : 0) = 1 ] && [ -z "$CUR" ]; then up_fail "Couldn't read which version of \(name) is installed, so nothing was replaced"; fi
+        up_stop_shipit
+        mkdir -p "$SV"
+        # Copies saved by Update pls 0.3 sit directly in the folder; file them under their version.
+        if [ -d "$SV/$AN" ] && [ ! -L "$SV/$AN" ] && [ "$NEW" != "$SV/$AN" ]; then
+          old=$(defaults read "$SV/$AN/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo unknown)
+          rm -rf "$SV/$old/$AN"; mkdir -p "$SV/$old"; mv "$SV/$AN" "$SV/$old/$AN"
+        fi
+        KEEP="$SV/${CUR:-unknown}"
+        rm -rf "$KEEP/$AN"; mkdir -p "$KEEP"
+        if [ "$(dev "$KEEP")" = "$(dev "$DEST")" ]; then
+          OLD="$KEEP/$AN"
+        else
+          # Moved aside next to the app, then filed under the saved versions once the new version is in.
+          OLD="$DEST/.$AN.update-pls-old"
+          if [ -e "$OLD" ]; then up_fail "\(name)'s previous version from an earlier update is still waiting to be saved at $OLD; move it somewhere safe or delete it, then press Retry"; fi
+        fi
+        # If this is cut off, the next run finishes it (see macRecoverBody).
         MARK=\(marker.map { "\"$HOME/\"" + Shell.q($0) } ?? "\"$ST/.nomark\"")
         mkdir -p "$(dirname "$MARK")"; printf '%s\\n%s\\n%s\\n' "$APP" "$OLD" \(Shell.q(key)) > "$MARK"
         mv "$APP" "$OLD" || up_fail "Couldn't move the current version aside"
         up_unregister "$OLD"
         if ! mv "$NEW" "$APP"; then rm -rf "$APP"; mv "$OLD" "$APP"; rm -f "$MARK"; up_fail "Couldn't install \(name) $WANT; the previous version was put back"; fi
-        rm -f "$MARK"
-        if [ "$OLD" != "$KEEP/$AN" ]; then
-          if ditto "$OLD" "$KEEP/$AN"; then rm -rf "$OLD"; up_unregister "$KEEP/$AN"; else echo "Couldn't keep $CUR for rollback (it is still at $OLD)" >&2; fi
+        TMPNEW=""
+        if [ "$OLD" = "$KEEP/$AN" ]; then
+          rm -f "$MARK"; touch "$KEEP"; echo "BACKUP	$CUR"
+        else
+          printf '%s\\n%s\\n%s\\n%s\\n' "$APP" "$OLD" \(Shell.q(key)) "$KEEP/$AN" > "$MARK"
+          if up_file_old "$OLD" "$KEEP/$AN"; then
+            rm -f "$MARK"; up_unregister "$KEEP/$AN"; touch "$KEEP"; echo "BACKUP	$CUR"
+          else
+            echo "Couldn't save $CUR for rollback yet (it is at $OLD); the next update tries again" >&2
+          fi
         fi
-        touch "$KEEP"
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
         NOW=$(current)
         echo "INSTALLED	$NOW"
-        rm -rf "$ST"
         # A saved copy of the version now installed is only a duplicate.
-        if [ -n "$NOW" ] && [ "$NOW" != "$CUR" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
+        if [ -n "$NOW" ] && [ "$NOW" != "$CUR" ] && [ ! -L "$SV/$NOW" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
+        # A copy made before quitting is filed if it is the only one of its version, and only then removed.
+        if ! up_keep_pre 0; then echo "Couldn't save the copy made before quitting (it is at $ST/pre)" >&2; fi
+        find "$ST" -mindepth 1 -maxdepth 1 ! -name pre -exec rm -rf {} + 2>/dev/null || true
+        rmdir "$ST" 2>/dev/null || true
         \(macPruneSnippet(keep: keep))
 
         """
     }
 
     /// Keeps only the newest `keep` saved versions of "$AN" in "$SV" (variants of one app share the folder).
+    /// Never through a symlink: not if any folder from $HOME down to "$SV" is one, nor a version folder or app.
     static func macPruneSnippet(keep: Int) -> String {
         """
-        for d in "$SV"/*; do if [ -d "$d" ] && [ -z "$(ls -A "$d")" ]; then rmdir "$d"; fi; done
-        n=0
-        for d in $(ls -1t "$SV"); do
-          if [ -d "$SV/$d/$AN" ]; then
-            n=$((n + 1))
-            if [ $n -gt \(max(keep, 1)) ]; then rm -rf "$SV/$d/$AN"; rmdir "$SV/$d" 2>/dev/null || true; fi
-          fi
-        done
+        up_sv_safe() {
+          up_p="$HOME"; up_rest=${SV#"$HOME"/}
+          IFS=/ read -r -a up_parts <<< "$up_rest"
+          for up_c in "${up_parts[@]}"; do up_p="$up_p/$up_c"; if [ -L "$up_p" ]; then return 1; fi; done
+          [ -d "$SV" ]
+        }
+        if up_sv_safe; then
+          for d in "$SV"/*; do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir "$d" 2>/dev/null || true; fi; done
+          n=0
+          while IFS= read -r d; do
+            if [ -n "$d" ] && [ ! -L "$SV/$d" ] && [ -d "$SV/$d/$AN" ] && [ ! -L "$SV/$d/$AN" ]; then
+              n=$((n + 1))
+              if [ $n -gt \(max(keep, 1)) ]; then rm -rf "$SV/$d/$AN"; rmdir "$SV/$d" 2>/dev/null || true; fi
+            fi
+          done < <(ls -1t "$SV")
+        fi
         """
     }
 
     /// Clones the installed app before it quits (instant and free on APFS, a full copy elsewhere): an app that
-    /// installs its own update on quit replaces itself without keeping the old version.
+    /// installs its own update on quit replaces itself without keeping the old version. A copy left from an earlier
+    /// update is filed first; if it can't be, nothing goes on (it may be the only copy of its version).
     static func macCloneScript(app: String, bundleID: String, stage: String, saved: String) -> String {
-        macHeader(app: app, bundleID: bundleID) + """
+        macHeader(app: app, bundleID: bundleID) + keepPreFunction + """
         ST="$HOME/"\(Shell.q(stage)); SV="$HOME/"\(Shell.q(saved)); AN=\(Shell.q((app as NSString).lastPathComponent))
-        \(keepPreFunction)
-        up_keep_pre 0 || true
+        if ! up_keep_pre 0; then
+          up_fail "A copy of \((app as NSString).lastPathComponent) kept from an earlier update couldn't be saved for rollback (it is at $ST/pre); move it somewhere safe or delete it, then press Retry"
+        fi
         rm -rf "$ST/pre"; mkdir -p "$ST/pre"
         if ! cp -cR "$APP" "$ST/pre/$AN" 2>/dev/null; then rm -rf "$ST/pre/$AN"; ditto "$APP" "$ST/pre/$AN"; fi
+        touch "$ST/pre/.complete"
         echo "CLONED	$(defaults read "$ST/pre/$AN/Contents/Info" CFBundleShortVersionString)"
 
         """
     }
 
     /// `up_keep_pre FORCE`: files a copy made before quitting ("$ST/pre/$AN") under its version in "$SV", unless it
-    /// is only a duplicate (already saved, or, without FORCE, the version still installed). Fails, keeping the
-    /// copy where it is, only if it couldn't be moved.
+    /// is only a duplicate (already saved, or, without FORCE, the version still installed). A copy that was cut
+    /// off while it was being made is dropped. Fails, keeping the copy where it is, if it couldn't be filed.
+    /// Every step is checked by hand: it runs in conditions, where `set -e` doesn't apply.
     static let keepPreFunction = """
         up_keep_pre() {
           PRE="$ST/pre/$AN"
-          [ -d "$PRE" ] || return 0
-          V=$(defaults read "$PRE/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)
-          if [ -z "$V" ] || [ -d "$SV/$V/$AN" ] || { [ "$1" != 1 ] && [ "$(current)" = "$V" ]; }; then rm -rf "$PRE"; return 0; fi
-          mkdir -p "$SV/$V" && mv "$PRE" "$SV/$V/$AN" || return 1
-          up_unregister "$SV/$V/$AN"; touch "$SV/$V"; echo "BACKUP	$V"
+          [ -e "$ST/pre" ] || return 0
+          if [ ! -f "$ST/pre/.complete" ] || [ ! -d "$PRE" ]; then rm -rf "$ST/pre"; return 0; fi
+          V=$(defaults read "$PRE/Contents/Info" CFBundleShortVersionString 2>/dev/null) || V=""
+          [ -n "$V" ] || return 1
+          if [ -d "$SV/$V/$AN" ]; then rm -rf "$ST/pre"; echo "BACKUP	$V"; return 0; fi
+          if [ "$1" != 1 ] && [ "$(current)" = "$V" ]; then rm -rf "$ST/pre"; return 0; fi
+          mkdir -p "$SV/$V" || return 1
+          mv "$PRE" "$SV/$V/$AN" || return 1
+          rm -rf "$ST/pre"
+          up_unregister "$SV/$V/$AN"
+          touch "$SV/$V" 2>/dev/null || true
+          echo "BACKUP	$V"
+          return 0
         }
+
         """
 
     /// Removes a staged update. A copy of the app made before quitting is kept for rollback first; with `force`,
     /// even when it is the version still installed (its own updater may still be about to replace it).
     static func macDiscardScript(app: String, bundleID: String, stage: String, saved: String, force: Bool) -> String {
-        macHeader(app: app, bundleID: bundleID) + """
+        macHeader(app: app, bundleID: bundleID) + keepPreFunction + """
         ST="$HOME/"\(Shell.q(stage)); SV="$HOME/"\(Shell.q(saved)); AN=\(Shell.q((app as NSString).lastPathComponent))
-        \(keepPreFunction)
-        if up_keep_pre \(force ? 1 : 0); then rm -rf "$ST"; else echo "Couldn't keep the copy made before quitting; it is still at $ST/pre" >&2; rm -rf "$ST/x" "$ST/dl"; fi
+        if up_keep_pre \(force ? 1 : 0); then
+          rm -rf "$ST"
+        else
+          echo "Couldn't save the copy made before quitting; it is still at $ST/pre" >&2
+          find "$ST" -mindepth 1 -maxdepth 1 ! -name pre -exec rm -rf {} + 2>/dev/null || true
+        fi
 
         """
     }
 
+    /// Only the download: for when the saved versions can't be locked, so a copy made before quitting stays put.
+    static func macDiscardDownloadScript(stage: String) -> String {
+        "ST=\"$HOME/\"\(Shell.q(stage))\nfind \"$ST\" -mindepth 1 -maxdepth 1 ! -name pre -exec rm -rf {} + 2>/dev/null || true\n"
+    }
+
     /// Files the clone made before quitting under its version, once the app's own updater has replaced the app.
     static func macKeepCloneScript(app: String, bundleID: String, stage: String, saved: String, keep: Int) -> String {
-        macHeader(app: app, bundleID: bundleID) + """
+        macHeader(app: app, bundleID: bundleID) + keepPreFunction + """
         ST="$HOME/"\(Shell.q(stage)); SV="$HOME/"\(Shell.q(saved)); AN=\(Shell.q((app as NSString).lastPathComponent))
-        PRE="$ST/pre/$AN"
-        [ -d "$PRE" ] || up_fail "The copy made before quitting is gone"
-        V=$(defaults read "$PRE/Contents/Info" CFBundleShortVersionString)
-        rm -rf "$SV/$V/$AN"; mkdir -p "$SV/$V"
-        mv "$PRE" "$SV/$V/$AN"
-        up_unregister "$SV/$V/$AN"
-        touch "$SV/$V"
-        echo "BACKUP	$V"
+        [ -f "$ST/pre/.complete" ] && [ -d "$ST/pre/$AN" ] || up_fail "The copy made before quitting is gone"
+        up_keep_pre 1 || up_fail "Couldn't save the copy made before quitting (it is still at $ST/pre)"
         NOW=$(current)
-        if [ -n "$NOW" ] && [ "$NOW" != "$V" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
+        if [ -n "$NOW" ] && [ "$NOW" != "$V" ] && [ ! -L "$SV/$NOW" ]; then rm -rf "$SV/$NOW/$AN"; rmdir "$SV/$NOW" 2>/dev/null || true; fi
         \(macPruneSnippet(keep: keep))
 
         """
@@ -1005,10 +1092,16 @@ extension Engine {
         return res.ok ? nil : failure(res)
     }
 
-    static func reopen(_ item: Item, app: String, bundleID: String, _ r: Reporter, run: ScriptRunner) async {
+    /// Nil once it is open again, else why not.
+    @discardableResult
+    static func reopen(_ item: Item, app: String, bundleID: String, _ r: Reporter, run: ScriptRunner) async -> String? {
         r.phase("Reopening \(item.name)")
         let res = await run(macOpenScript(app: app, bundleID: bundleID), 60, r.sink)
-        if !res.ok { Log.error("reopen \(item.key): \(failure(res))") }
+        guard res.ok else {
+            Log.error("reopen \(item.key): \(failure(res))")
+            return "Couldn't reopen \(item.name): \(failure(res))"
+        }
+        return nil
     }
 
     enum AppSource { case download(LatestInfo), saved }
@@ -1041,20 +1134,29 @@ extension Engine {
             return exact ? c == target : !Version.isNewer(target, than: c)
         }
         let saved = savedPath(item)
-        /// Set once the app was cloned before quitting: from then on that copy may be the only one of its version.
-        var cloned = false
-        /// Clean-up and reopening always run to the end, even for a cancelled job.
+        /// Clean-up and reopening always run to the end, even for a cancelled job. A copy made before quitting is
+        /// filed only while holding the backups lock; without it, only the download is removed.
         func discard(force: Bool = false) async {
-            let script = macDiscardScript(app: app, bundleID: bid, stage: stage, saved: saved, force: force)
+            var script = macDiscardScript(app: app, bundleID: bid, stage: stage, saved: saved, force: force)
             var lock: ItemLock?
-            if cloned, item.machine.isLocal, case let .success(l) = await ItemLock.take(ItemLock.backupsKey, waitingUpTo: 120) { lock = l }
+            if item.machine.isLocal {
+                if case let .success(l) = await ItemLock.take(ItemLock.backupsKey, waitingUpTo: 120) { lock = l }
+                else { script = macDiscardDownloadScript(stage: stage) }
+            }
             let res = await Task.detached { await run(script, 120, nil) }.value
             lock?.release()
             if !res.ok { Log.error("\(item.key): couldn't clean up its staged update: \(failure(res))") }
             else if let b = fields(res)["BACKUP"] { Log.info("\(item.key): kept \(b) for rollback") }
         }
-        func reopenApp() async {
+        /// Nil once the app is open again, else why not.
+        func reopenApp() async -> String? {
             await Task.detached { await reopen(item, app: app, bundleID: bid, r, run: run) }.value
+        }
+        func withReopenNote(_ o: UpdateOutcome, _ note: String?) -> UpdateOutcome {
+            guard let note else { return o }
+            var o = o
+            o.message += o.ok ? " (\(note))" : ". \(note)"
+            return o
         }
         /// A step that adds to or removes from this Mac's saved versions, so Settings can't clean them up meanwhile.
         func backupStep(_ script: String, _ timeout: TimeInterval) async -> (ShellResult, [String: String]) {
@@ -1073,8 +1175,9 @@ extension Engine {
         }
 
         r.phase("Checking \(name)")
-        let (s0, f0) = await step(macStateScript(app: app, bundleID: bid, marker: swapMarkerPath(item)), 60)
+        let (s0, f0) = await backupStep(macStateScript(app: app, bundleID: bid, marker: swapMarkerPath(item)), 60)
         if let a = f0["RECOVERED"] { Log.error("\(item.key): put \(a) back after an interrupted update") }
+        if let a = f0["FILED"] { Log.info("\(item.key): saved \(a) for rollback, left over from an interrupted update") }
         guard s0.ok else { return failed(s0) }
         // A dry run always downloads and checks the build, to prove the update would work.
         if done(f0["CURRENT"]) && !dryRun {
@@ -1144,9 +1247,15 @@ extension Engine {
         guard r.commit() else { await discard(); return .cancelledOutcome(output: log) }
 
         // Whatever goes wrong from here, an app that was open is opened again (the old version is still in place).
-        func giveUp(_ o: UpdateOutcome, force: Bool = false) async -> UpdateOutcome {
+        func giveUp(_ o: UpdateOutcome, force: Bool = false, recover: Bool = false) async -> UpdateOutcome {
+            if recover {
+                // A swap that failed half way may have left the app moved aside: put it back before opening it.
+                let (rr, rf) = await backupStep(macRecoverScript(marker: swapMarkerPath(item)), 120)
+                if let a = rf["RECOVERED"] { Log.error("\(item.key): put \(a) back after a failed swap") }
+                if !rr.ok || rf["RECOVER_FAILED"] != nil { Log.error("\(item.key): couldn't put the previous version back after a failed swap") }
+            }
             await discard(force: force)
-            if relaunch && wasRunning { await reopenApp() }
+            if relaunch && wasRunning { return withReopenNote(o, await reopenApp()) }
             return o
         }
         if wasRunning {
@@ -1156,7 +1265,6 @@ extension Engine {
                 await discard()
                 return .fail("Couldn't keep a copy of \(name) for rollback, so it wasn't quit or updated: \(failure(sc))", output: log)
             }
-            cloned = true
             if let err = await quitApp(item, app: app, bundleID: bid, r, run: run, log: &log) {
                 await discard()
                 return .fail(err, output: log)
@@ -1165,7 +1273,11 @@ extension Engine {
             let (s2, f2) = await step(macWaitUpdaterScript(app: app, bundleID: bid, name: name), 400)
             // Its updater may still be working on the app: leave reopening it to that updater, and keep the copy
             // made before quitting, since that updater is about to replace the version it holds.
-            guard s2.ok else { await discard(force: true); return failed(s2) }
+            guard s2.ok else {
+                if f2["UPDATER_BUSY"] != nil { await discard(force: true); return failed(s2) }
+                // Couldn't tell (the connection dropped, the check failed): the app is closed, so open it again.
+                return await giveUp(failed(s2), force: true)
+            }
             installedNow = f2["CURRENT"] ?? ""
             // Its own updater replaced it: keep the copy so it can still be rolled back.
             var kept: String?
@@ -1175,9 +1287,9 @@ extension Engine {
             }
             if !exact && done(installedNow) {
                 await discard(force: kept == nil && installedNow != c)
-                if relaunch && f2["RUNNING"] != "1" { await reopenApp() }
-                return UpdateOutcome(ok: true, message: "\(name) installed its own update to \(installedNow)", output: log,
-                                     previous: kept, installed: installedNow)
+                let note = relaunch && f2["RUNNING"] != "1" ? await reopenApp() : nil
+                return withReopenNote(UpdateOutcome(ok: true, message: "\(name) installed its own update to \(installedNow)", output: log,
+                                                    previous: kept, installed: installedNow), note)
             }
             // Its updater may have reopened it; quit it once more.
             if f2["RUNNING"] == "1", let err = await quitApp(item, app: app, bundleID: bid, r, run: run, log: &log) {
@@ -1187,18 +1299,22 @@ extension Engine {
 
         // An update only ever moves forward from what is installed right now, which the app's own updater may
         // have changed since the download was checked.
-        if !exact, !installedNow.isEmpty, !Version.isNewer(candidate, than: installedNow) {
+        if !exact && installedNow.isEmpty {
+            return await giveUp(.fail("Couldn't read which version of \(name) is installed, so nothing was replaced", output: log))
+        }
+        if !exact, !Version.isNewer(candidate, than: installedNow) {
             return await giveUp(.fail("\(name) is on \(installedNow) now, and the download (\(candidate)) isn't newer; nothing was installed", output: log))
         }
 
         let (s3, f3) = await backupStep(macSwapScript(app: app, bundleID: bid, name: name, staged: staged, version: target, stage: stage,
                                                       saved: saved, keep: keep, marker: swapMarkerPath(item), key: item.key,
-                                                      trust: trust, expect: installedNow.isEmpty ? nil : installedNow), 600)
-        guard s3.ok else { return await giveUp(failed(s3)) }
-        if relaunch && wasRunning { await reopenApp() }
+                                                      trust: trust, expect: installedNow.isEmpty ? nil : installedNow,
+                                                      forward: !exact), 600)
+        guard s3.ok else { return await giveUp(failed(s3), recover: true) }
+        let note = relaunch && wasRunning ? await reopenApp() : nil
         let installed = f3["INSTALLED"].flatMap { $0.isEmpty ? nil : $0 }
         let previous = f3["BACKUP"].flatMap { $0.isEmpty ? nil : $0 }
-        return UpdateOutcome(ok: true, message: "\(verb) \(installed ?? target)", output: log, previous: previous, installed: installed)
+        return withReopenNote(UpdateOutcome(ok: true, message: "\(verb) \(installed ?? target)", output: log, previous: previous, installed: installed), note)
     }
 
     /// Apps installed with Homebrew: same quit-and-wait as above, then `brew upgrade --cask`.
@@ -1208,7 +1324,7 @@ extension Engine {
         let bid = item.machine.isLocal ? Bundle(path: item.path)?.bundleIdentifier ?? "" : ""
         var log = ""
         let target = item.latest?.version ?? ""
-        func reopenApp() async {
+        func reopenApp() async -> String? {
             await Task.detached { await reopen(item, app: item.path, bundleID: bid, r, run: run) }.value
         }
         r.phase("Checking \(item.name)")
@@ -1222,10 +1338,16 @@ extension Engine {
             if let err = await quitApp(item, app: item.path, bundleID: bid, r, run: run, log: &log) { return .fail(err, output: log) }
             let w = await run(macWaitUpdaterScript(app: item.path, bundleID: bid, name: item.name), 400, r.sink)
             log += w.combined + "\n"
-            guard w.ok else { return .fail(failure(w), output: log) }
+            guard w.ok else {
+                var o = UpdateOutcome.fail(failure(w), output: log)
+                // Only an updater known to be at work is left to reopen the app itself.
+                if fields(w)["UPDATER_BUSY"] == nil, relaunch, let note = await reopenApp() { o.message += ". \(note)" }
+                return o
+            }
             if let cur = fields(w)["CURRENT"], !cur.isEmpty, !target.isEmpty, !Version.isNewer(target, than: cur) {
-                if relaunch && fields(w)["RUNNING"] != "1" { await reopenApp() }
-                return UpdateOutcome(ok: true, message: "\(item.name) installed its own update to \(cur)", output: log, installed: cur)
+                var o = UpdateOutcome(ok: true, message: "\(item.name) installed its own update to \(cur)", output: log, installed: cur)
+                if relaunch && fields(w)["RUNNING"] != "1", let note = await reopenApp() { o.message += " (\(note))" }
+                return o
             }
         }
         // Unload any lingering Squirrel ShipIt launchd job before Homebrew deletes and moves the app bundle.
@@ -1238,13 +1360,17 @@ extension Engine {
         let res = await Runner.run(item.machine, os: .mac, script: prelude + "set -e\n" + brewRefresh(item) + cmd + "\n", timeout: 1800, onOutput: r.sink)
         log += res.combined + "\n"
         r.showLines = false
-        if relaunch && wasRunning { await reopenApp() }
+        let note = relaunch && wasRunning ? await reopenApp() : nil
+        if res.stdout.contains("BREW_REFRESHED\t") { noteBrewRefreshed(item) }
         guard res.ok else {
             var o = UpdateOutcome.fail(failure(res), output: log)
             o.timedOut = res.timedOut
+            if let note { o.message += ". \(note)" }
             return o
         }
-        return UpdateOutcome(ok: true, message: "Updated", output: log)
+        var o = UpdateOutcome(ok: true, message: "Updated", output: log)
+        if let note { o.message += " (\(note))" }
+        return o
     }
 
     /// Unloads the app's Squirrel ShipIt launchd job, reading its bundle ID on the machine it runs on.
