@@ -119,10 +119,19 @@ struct MenuView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(pending.openNames.count == 1 ? "\(pending.openNames[0]) is open" : "\(pending.openNames.count) apps are open")
                         .font(.subheadline.weight(.semibold))
-                    Text(pending.openNames.joined(separator: ", ") + (pending.openNames.count == 1 ? " will quit, update and reopen." : " will each quit, update and reopen."))
+                    Text(pending.openNames.count == 1 ? "It quits to update. Reopen it afterwards?" : "They quit to update. Tick the ones to reopen afterwards.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(pending.openApps, id: \.key) { app in
+                    Toggle(isOn: Binding(get: { model.reopens(app) }, set: { model.setReopens(app, $0) })) {
+                        Text("Reopen " + (app.machine.isLocal ? app.name : "\(app.name) on \(app.machine.name)")).font(.caption)
+                    }
+                    .toggleStyle(.checkbox).controlSize(.small)
+                }
+            }
+            .padding(.leading, 24)
             HStack(spacing: 8) {
                 Toggle("Don't ask again", isOn: $dontAskAgain)
                     .toggleStyle(.checkbox).controlSize(.small).font(.caption)
@@ -131,7 +140,7 @@ struct MenuView: View {
                     dontAskAgain = false
                     model.cancelPendingQuit()
                 }.controlSize(.small)
-                Button("Update & Relaunch") {
+                Button("Update") {
                     let remember = dontAskAgain
                     dontAskAgain = false
                     model.confirmPendingQuit(dontAskAgain: remember)
@@ -443,6 +452,9 @@ struct ItemRow: View {
     @ViewBuilder var menuItems: some View {
         Button(skipped ? "Include in Update all" : "Skip in Update all") { model.toggleExcluded(item) }
         Button("Hide from list") { model.hidden.insert(item.key) }
+        if item.isApp {
+            Toggle("Reopen after updating", isOn: Binding(get: { model.reopens(item) }, set: { model.setReopens(item, $0) }))
+        }
         if item.supportsRollback && !model.isActive(item) { versionMenu }
         if let notesURL = model.releaseNotesURL(for: item) {
             Button("Release notes…") { NSWorkspace.shared.open(notesURL) }
@@ -555,7 +567,7 @@ struct ItemRow: View {
             } else if item.needsSudo, let cmd = item.command {
                 Button("Copy sudo command") { copy(cmd) }.controlSize(.small).help(cmd)
             } else if item.state == .available && item.canUpdate {
-                Button(item.running ? "Update & Relaunch" : "Update") { model.update(item) }
+                Button(item.running ? (model.reopens(item) ? "Update & Relaunch" : "Update & Close") : "Update") { model.update(item) }
                     .buttonStyle(.borderedProminent).controlSize(.small).disabled(model.selfUpdating)
             } else if item.state == .available {
                 Text("Update manually").font(.caption).foregroundStyle(.secondary)
@@ -612,6 +624,17 @@ struct SettingsView: View {
                     }
                 }
             }
+            if !model.reopenChoices.isEmpty {
+                Section(model.reopenApps ? "Stay closed after updating" : "Reopen after updating") {
+                    ForEach(model.reopenChoices.keys.sorted(), id: \.self) { key in
+                        HStack {
+                            Text(model.label(forKey: key))
+                            Spacer()
+                            Button(model.reopenApps ? "Reopen" : "Keep closed") { model.reopenChoices[key] = nil }
+                        }
+                    }
+                }
+            }
             if !model.hidden.isEmpty {
                 Section("Hidden tools") {
                     ForEach(model.hidden.sorted(), id: \.self) { key in
@@ -630,6 +653,8 @@ struct SettingsView: View {
                 Toggle("Open at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
                 Toggle("Show notifications", isOn: $model.notificationsEnabled)
                 Toggle("Ask before quitting open apps", isOn: $model.askBeforeQuitting)
+                Toggle("Reopen apps after updating", isOn: $model.reopenApps)
+                    .help("An app that was open is opened again once it's updated. Choose per app in its ⋯ menu, or when Update all asks.")
                 Toggle("Prefer direct downloads over Homebrew Cask", isOn: $model.preferDirectDownloads)
                     .help("Updates Mac apps directly with APFS rollback backups, signature verification and pending-update reuse instead of brew upgrade --cask")
             }

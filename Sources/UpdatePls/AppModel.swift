@@ -50,6 +50,8 @@ final class AppModel: ObservableObject {
     struct PendingQuit: Equatable {
         let targets: [Item]
         let openNames: [String]
+        /// The open apps among the targets, each with a reopen choice in the banner.
+        var openApps: [Item] = []
     }
 
     @Published var statuses: [MachineStatus] = []
@@ -96,6 +98,14 @@ final class AppModel: ObservableObject {
     @Published var askBeforeQuitting: Bool {
         didSet { UserDefaults.standard.set(!askBeforeQuitting, forKey: "dontAskBeforeQuitting") }
     }
+    /// Whether an app that was open is reopened after its update, unless it has its own choice below.
+    @Published var reopenApps: Bool {
+        didSet { UserDefaults.standard.set(!reopenApps, forKey: "dontReopenApps") }
+    }
+    /// Per-app reopen choices (`machine/tool`), which win over `reopenApps`.
+    @Published var reopenChoices: [String: Bool] {
+        didSet { UserDefaults.standard.set(reopenChoices, forKey: "reopenChoices") }
+    }
     /// Prefer direct downloads over Homebrew Cask for Mac apps (enables APFS rollback, signature checks, ShipIt safety).
     @Published var preferDirectDownloads: Bool {
         didSet {
@@ -120,10 +130,11 @@ final class AppModel: ObservableObject {
     @Published var isCleaningBackups = false
 
     /// How a job runs and how a machine is re-checked afterwards; tests swap these out.
-    var perform: (Item, Job, Reporter) async -> UpdateOutcome = { item, job, r in
+    /// `relaunch`: reopen an app that was open (see `reopens(_:)`).
+    var perform: (Item, Job, Bool, Reporter) async -> UpdateOutcome = { item, job, relaunch, r in
         switch job {
-        case .update: await Engine.update(item, relaunch: true, reporter: r)
-        case let .install(v, source): await Engine.install(item, version: v, from: source, relaunch: true, reporter: r)
+        case .update: await Engine.update(item, relaunch: relaunch, reporter: r)
+        case let .install(v, source): await Engine.install(item, version: v, from: source, relaunch: relaunch, reporter: r)
         }
     }
     private var customScan = false
@@ -177,6 +188,8 @@ final class AppModel: ObservableObject {
         waitingForSignIn = Set(UserDefaults.standard.stringArray(forKey: "waitingForSignIn") ?? [])
         notified = Set(UserDefaults.standard.stringArray(forKey: "notifiedUpdates") ?? [])
         askBeforeQuitting = !UserDefaults.standard.bool(forKey: "dontAskBeforeQuitting")
+        reopenApps = !UserDefaults.standard.bool(forKey: "dontReopenApps")
+        reopenChoices = UserDefaults.standard.dictionary(forKey: "reopenChoices") as? [String: Bool] ?? [:]
         preferDirectDownloads = !UserDefaults.standard.bool(forKey: "useHomebrewForApps")
         notificationsEnabled = !UserDefaults.standard.bool(forKey: "disableNotifications")
         let h = UserDefaults.standard.double(forKey: "intervalHours")
@@ -240,6 +253,15 @@ final class AppModel: ObservableObject {
     }
 
     /// "Cursor on my-server" for a hidden/skipped tool's key, for Settings.
+    /// Whether this app is opened again after its update, if it was open.
+    func reopens(_ item: Item) -> Bool { reopens(key: item.key) }
+    func reopens(key: String) -> Bool { reopenChoices[key] ?? reopenApps }
+
+    func setReopens(_ item: Item, _ on: Bool) {
+        // A choice that matches the default isn't kept, so changing the default later still applies to it.
+        reopenChoices[item.key] = on == reopenApps ? nil : on
+    }
+
     func label(forKey key: String) -> String {
         guard let i = items.first(where: { $0.key == key }) else { return key }
         return i.machine.isLocal ? i.name : "\(i.name) on \(i.machine.name)"
@@ -540,7 +562,7 @@ final class AppModel: ObservableObject {
         let open = targets.filter { t in t.isApp && (t.machine.isLocal ? !LocalApps.instances(t.path).isEmpty : t.running) }
         if !open.isEmpty && askBeforeQuitting {
             let names = open.map { $0.machine.isLocal ? $0.name : "\($0.name) on \($0.machine.name)" }
-            pendingQuit = PendingQuit(targets: targets, openNames: names)
+            pendingQuit = PendingQuit(targets: targets, openNames: names, openApps: open)
             return
         }
         if logAll { Log.info("Update all: \(targets.map(\.key).joined(separator: ", "))") }
@@ -780,9 +802,10 @@ final class AppModel: ObservableObject {
         }
         reporters[key] = reporter
         let performFn = perform
+        let relaunch = !item.isApp || reopens(item)
         let task = Task<UpdateOutcome, Never> {
-            Log.appendRun(file, headerLine)
-            let outcome = await performFn(item, job, reporter)
+            Log.appendRun(file, headerLine + (relaunch ? "" : "(stays closed after the update if it was open)\n"))
+            let outcome = await performFn(item, job, relaunch, reporter)
             Log.appendRun(file, "\n\(Log.stamp()) \(outcome.cancelled ? "Cancelled" : outcome.ok ? "Done" : "FAILED"): \(outcome.message)\n")
             return outcome
         }
@@ -901,7 +924,7 @@ final class AppModel: ObservableObject {
         let alert = NSAlert()
         alert.messageText = older ? "Roll back \(item.name) to \(v)?" : "Switch \(item.name) to \(v)?"
         alert.informativeText = [
-            open ? "\(item.name) will quit and reopen." : nil,
+            open ? (reopens(item) ? "\(item.name) will quit and reopen." : "\(item.name) will quit and stay closed.") : nil,
             older && item.isApp ? "Older versions may not open data saved by newer ones." : nil,
             (item.latest.map { Version.isNewer($0.version, than: v) } ?? false) ? "It will be skipped in Update all until you include it again." : nil,
         ].compactMap { $0 }.joined(separator: " ")

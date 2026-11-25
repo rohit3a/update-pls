@@ -881,7 +881,7 @@ final class UpdatePlsTests: XCTestCase {
         var b = a; b.defID = "b"; b.name = "B"; b.path = "/b"
         model.items = [a, b]
         var runs: [String] = []
-        model.perform = { item, _, r in
+        model.perform = { item, _, _, r in
             runs.append(item.key)
             r.phase("Working")
             try? await Task.sleep(for: .milliseconds(200))
@@ -929,7 +929,7 @@ final class UpdatePlsTests: XCTestCase {
         var b = a; b.defID = "b"; b.name = "B"; b.path = "/b"
         var c = a; c.defID = "c"; c.name = "C"; c.path = "/c"
         model.items = [a, b, c]
-        model.perform = { item, _, _ in
+        model.perform = { item, _, _, _ in
             try? await Task.sleep(for: .milliseconds(item.defID == "b" ? 1500 : 50))
             return UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
         }
@@ -964,7 +964,7 @@ final class UpdatePlsTests: XCTestCase {
         let own = item("own", .selfUpdate(path: "/own", args: "update"))
         model.items = [n1, n2, app, own]
         let running = Box(Set<String>()), maxTogether = Box(0), npmTogether = Box(0)
-        model.perform = { item, _, _ in
+        model.perform = { item, _, _, _ in
             running.mutate { $0.insert(item.defID) }
             let now = running.value
             maxTogether.mutate { $0 = max($0, now.count) }
@@ -1002,7 +1002,7 @@ final class UpdatePlsTests: XCTestCase {
         a.state = .available
         model.items = [a]
         let signedIn = Box(false)
-        model.perform = { _, _, _ in
+        model.perform = { _, _, _, _ in
             signedIn.value ? UpdateOutcome(ok: true, message: "Updated", previous: "1.0")
                 : .fail(Engine.failure(ShellResult(status: 1, stdout: "", stderr: "Error: Update failed: [unauthenticated] Error")))
         }
@@ -1020,6 +1020,50 @@ final class UpdatePlsTests: XCTestCase {
         XCTAssertTrue(model.waitingForSignIn.isEmpty)
     }
 
+    /// Each app is reopened after its update or left closed, by its own choice or else the default.
+    @MainActor
+    func testReopenChoicesReachTheUpdate() async throws {
+        let saved = Log.dir
+        Log.dir = FileManager.default.temporaryDirectory.appendingPathComponent("up-log-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: Log.dir); Log.dir = saved }
+        let keys = ["dontReopenApps", "reopenChoices", "previousVersions"]
+        let before = keys.map { UserDefaults.standard.object(forKey: $0) }
+        defer { for (k, v) in zip(keys, before) { UserDefaults.standard.set(v, forKey: k) } }
+        UserDefaults.standard.removeObject(forKey: "dontReopenApps")
+        UserDefaults.standard.removeObject(forKey: "reopenChoices")
+        let model = AppModel(autostart: false)
+        func app(_ id: String, isApp: Bool = true) -> Item {
+            var i = Item(machine: .local, os: .mac, defID: id, name: id, brand: id, isApp: isApp, path: "/nonexistent/\(id).app",
+                         installed: "1.0", latest: LatestInfo(version: "2.0"), method: .selfUpdate(path: "/\(id)", args: "update"))
+            i.state = .available
+            return i
+        }
+        let a = app("a"), b = app("b"), cli = app("cli", isApp: false)
+        model.items = [a, b, cli]
+        let seen = Box<[String: Bool]>([:])
+        model.perform = { item, _, relaunch, _ in seen.mutate { $0[item.key] = relaunch }; return .fail("not really") }
+        model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [a, b, cli]) }
+        func runAll() async throws -> [String: Bool] {
+            seen.mutate { $0 = [:] }
+            model.items = [a, b, cli]
+            model.updateAll()
+            for _ in 0..<80 where model.isBusy { try await Task.sleep(for: .milliseconds(25)) }
+            return seen.value
+        }
+        XCTAssertTrue(model.reopenApps, "apps reopen by default, as before")
+        model.setReopens(b, false)
+        let first = try await runAll()
+        XCTAssertEqual(first, [a.key: true, b.key: false, cli.key: true])
+        XCTAssertFalse(AppModel(autostart: false).reopens(b), "remembered after a restart")
+        // With the default off, only the apps picked to reopen are opened again.
+        model.reopenApps = false
+        model.setReopens(a, true)
+        model.setReopens(b, false)
+        XCTAssertEqual(model.reopenChoices, [a.key: true], "a choice matching the default isn't kept")
+        let second = try await runAll()
+        XCTAssertEqual(second, [a.key: true, b.key: false, cli.key: true])
+    }
+
     /// Pressing Update with a row's old copy just after its update ended mustn't run it again.
     @MainActor
     func testStalePressAfterAnUpdateDoesNothing() async throws {
@@ -1034,7 +1078,7 @@ final class UpdatePlsTests: XCTestCase {
         a.state = .available
         model.items = [a]
         let runs = Box(0)
-        model.perform = { _, _, _ in runs.mutate { $0 += 1 }; return UpdateOutcome(ok: true, message: "Updated", previous: "1.0") }
+        model.perform = { _, _, _, _ in runs.mutate { $0 += 1 }; return UpdateOutcome(ok: true, message: "Updated", previous: "1.0") }
         var a2 = a; a2.installed = "2.0"; a2.state = .upToDate
         model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), [a2]) }
         model.update(a)
@@ -1090,9 +1134,9 @@ final class UpdatePlsTests: XCTestCase {
         print("LIVE targets: \(targets.map { "\($0.key) \($0.installed ?? "?") -> \($0.latest?.version ?? "?")" }), open: \(wasOpen.sorted())")
         var runs: [String: Int] = [:]
         let real = model.perform
-        model.perform = { item, job, r in
+        model.perform = { item, job, relaunch, r in
             runs[item.key, default: 0] += 1
-            return await real(item, job, r)
+            return await real(item, job, relaunch, r)
         }
         let start = Date()
         func t() -> String { String(format: "%6.1fs", Date().timeIntervalSince(start)) }
@@ -1182,7 +1226,7 @@ final class UpdatePlsTests: XCTestCase {
         a.state = .upToDate
         model.items = [a]
         let jobs = Box<[AppModel.Job]>([])
-        model.perform = { _, job, _ in jobs.mutate { $0.append(job) }; return .fail("network down") }
+        model.perform = { _, job, _, _ in jobs.mutate { $0.append(job) }; return .fail("network down") }
         let found = [a]
         model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .mac, state: .online), found) }
         model.enqueue([(a, .install("1.0", .published))])
@@ -1277,7 +1321,7 @@ final class UpdatePlsTests: XCTestCase {
         a.state = .available
         var b = a; b.defID = "b"; b.name = "B"; b.path = "/b"
         model.items = [a, b]
-        model.perform = { _, _, r in
+        model.perform = { _, _, _, r in
             r.phase("Downloading")
             let res = await Shell.run("/bin/sleep", ["30"], timeout: 60)
             return res.cancelled ? .cancelledOutcome() : UpdateOutcome(ok: true, message: "Updated")
@@ -1349,7 +1393,7 @@ final class UpdatePlsTests: XCTestCase {
         model.disabledHosts = []
         model.items = [remoteApp]
         let ran = Box(false)
-        model.perform = { _, _, _ in ran.mutate { $0 = true }; return UpdateOutcome(ok: true, message: "Updated") }
+        model.perform = { _, _, _, _ in ran.mutate { $0 = true }; return UpdateOutcome(ok: true, message: "Updated") }
         let updatedRemote: Item = { var x = remoteApp; x.installed = "2.0"; x.state = .upToDate; return x }()
         model.scan = { m, _, _, _ in (MachineStatus(machine: m, os: .linux, state: .online), [updatedRemote]) }
 
@@ -1444,7 +1488,7 @@ final class UpdatePlsTests: XCTestCase {
         a.state = .available
         let finished = Box(false)
         model.items = [a]
-        model.perform = { _, _, r in
+        model.perform = { _, _, _, r in
             r.phase("Downloading")
             try? await Task.sleep(for: .milliseconds(300))
             guard r.commit() else { return .cancelledOutcome() }
@@ -1811,7 +1855,7 @@ final class UpdatePlsTests: XCTestCase {
         var y = x; y.defID = "y"; y.name = "Y"; y.path = "/y"; y.method = .bun(package: "y")
         model.items = [x, y]
         let ran = Box<[String: String]>([:])
-        model.perform = { item, _, _ in
+        model.perform = { item, _, _, _ in
             ran.mutate { $0[item.defID] = AppModel.lane(item) }
             if item.defID == "x" { try? await Task.sleep(for: .milliseconds(300)) }
             return UpdateOutcome(ok: true, message: "Updated", changed: false)
